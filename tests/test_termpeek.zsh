@@ -70,39 +70,37 @@ _termpeek_escape
 [[ "$BUFFER" == "my_query" && "$_termpeek_dismissed_buf" == "my_query" && ${#_termpeek_matches[@]} -eq 0 ]] || { print "FAIL: Escape failed"; exit 1; }
 print "PASS: Escape closes menu and preserves prompt"
 
-# Test 10: Enter on highlighted command selects command
+# Test 10: Enter on normal command executes
 BUFFER="orig"
-_termpeek_matches=("first item" "selected command")
+_termpeek_matches=("first item" "normal command")
 _termpeek_idx=2
-# Simulate enter state change
-if (( ${#_termpeek_matches[@]} > 0 && _termpeek_idx > 0 )); then
-  BUFFER="${_termpeek_matches[$_termpeek_idx]}"
-fi
+# Safe non-interactive simulation of enter logic
+target="${_termpeek_matches[$_termpeek_idx]}"
+BUFFER="$target"
 _termpeek_matches=()
 _termpeek_idx=0
-[[ "$BUFFER" == "selected command" ]] || { print "FAIL: Enter failed"; exit 1; }
-print "PASS: Enter selects highlighted command"
+[[ "$BUFFER" == "normal command" ]] || { print "FAIL: Normal enter failed"; exit 1; }
+print "PASS: Enter selects normal command"
 
 # Test 11: Recipe fallback populates when history has space
 TERMPEEK_MAX_RESULTS=4
 TERMPEEK_RECIPES=1
 _termpeek_query "ffmpeg"
 [[ ${#_termpeek_matches[@]} -gt 0 ]] || { print "FAIL: Recipe fallback failed for ffmpeg"; exit 1; }
-# Check that at least one recipe was added and tracked
 local has_recipe=0
 for m in "${_termpeek_matches[@]}"; do
-  if [[ -n "${_termpeek_recipe_map[$m]}" ]]; then
+  if [[ -n "${_termpeek_tag_map[$m]}" ]]; then
     has_recipe=1
     break
   fi
 done
-[[ $has_recipe -eq 1 ]] || { print "FAIL: Recipe map not populated"; exit 1; }
+[[ $has_recipe -eq 1 ]] || { print "FAIL: Recipe tag not populated"; exit 1; }
 print "PASS: Recipe fallback populates when matching recipes exist"
 
 # Test 12: Recipes disabled when TERMPEEK_RECIPES=0
 TERMPEEK_RECIPES=0
 _termpeek_matches=()
-_termpeek_recipe_map=()
+_termpeek_tag_map=()
 local old_db="$_termpeek_db"
 _termpeek_db="/nonexistent/history.db"
 _termpeek_query "ffmpeg"
@@ -129,4 +127,62 @@ _termpeek_render
 TERMPEEK_SHOW_HINTS=1
 print "PASS: TERMPEEK_SHOW_HINTS=0 disables hint text"
 
-print "All 14 automated tests passed successfully."
+# Test 15: Project Task Discovery (package.json and Makefile)
+local test_dir=$(mktemp -d)
+cat << 'EOF' > "$test_dir/package.json"
+{
+  "name": "test-pkg",
+  "scripts": {
+    "test": "jest",
+    "dev": "vite",
+    "build": "vite build"
+  }
+}
+EOF
+cat << 'EOF' > "$test_dir/Makefile"
+lint:
+	golangci-lint run
+EOF
+
+(
+  cd "$test_dir"
+  _termpeek_cached_pwd=""
+  _termpeek_update_dir_cache
+  [[ " ${_termpeek_project_tasks[*]} " == *"npm test"* ]] || { print "FAIL: npm test not discovered"; exit 1; }
+  [[ " ${_termpeek_project_tasks[*]} " == *"npm run dev"* ]] || { print "FAIL: npm run dev not discovered"; exit 1; }
+  [[ " ${_termpeek_project_tasks[*]} " == *"make lint"* ]] || { print "FAIL: make lint not discovered"; exit 1; }
+)
+rm -rf "$test_dir"
+_termpeek_cached_pwd=""
+print "PASS: Project Task Discovery extracts package.json and Makefile tasks"
+
+# Test 16: Destructive Command Safety Guard detection and blocking
+_termpeek_is_dangerous "rm -rf /tmp/folder" || { print "FAIL: rm -rf not flagged as dangerous"; exit 1; }
+_termpeek_is_dangerous "git reset --hard HEAD~1" || { print "FAIL: git reset --hard not flagged"; exit 1; }
+_termpeek_is_dangerous "git push origin main --force" || { print "FAIL: git push --force not flagged"; exit 1; }
+_termpeek_is_dangerous "git status" && { print "FAIL: git status falsely flagged as dangerous"; exit 1; }
+
+# Simulate enter on dangerous command
+BUFFER="orig"
+_termpeek_matches=("rm -rf node_modules")
+_termpeek_idx=1
+_termpeek_enter
+[[ "$BUFFER" == "rm -rf node_modules" && "$POSTDISPLAY" == *"DANGER GUARD"* ]] || { print "FAIL: Danger guard did not pause execution"; exit 1; }
+print "PASS: Destructive Command Guard flags risk and prompts for review"
+
+# Test 17: Secret Sanitization and Redaction
+local secret_cmd="export OPENAI_API_KEY=sk-proj-abc12345678901234567890"
+_termpeek_has_secret "$secret_cmd" || { print "FAIL: Secret not detected"; exit 1; }
+local sanitized="$(_termpeek_sanitize_display "$secret_cmd")"
+[[ "$sanitized" == *"sk-proj****[REDACTED]"* ]] || { print "FAIL: Sanitization did not mask key: $sanitized"; exit 1; }
+[[ "$sanitized" != *"abc1234567890"* ]] || { print "FAIL: Raw key leaked in sanitized string"; exit 1; }
+
+local token_cmd="gh auth login --with-token ghp_xyz98765432101234567890"
+local sanitized_token="$(_termpeek_sanitize_display "$token_cmd")"
+[[ "$sanitized_token" == *"ghp_xyz9****[REDACTED]"* ]] || { print "FAIL: GitHub token not masked: $sanitized_token"; exit 1; }
+
+local safe_cmd="git commit -m 'Initial commit'"
+_termpeek_has_secret "$safe_cmd" && { print "FAIL: Safe command flagged as secret"; exit 1; }
+print "PASS: Secret Sanitizer redacts sensitive API keys and tokens"
+
+print "All 17 automated tests passed successfully."
