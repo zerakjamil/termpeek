@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="termpeek" width="520">
+</p>
+
 # termpeek
 
 Live type-ahead command history search for Zsh.
