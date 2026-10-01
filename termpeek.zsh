@@ -23,7 +23,7 @@ _termpeek_render() {
   for (( i=1; i<=${#_termpeek_matches[@]}; i++ )); do
     local item="${_termpeek_matches[$i]}"
     (( $#item > max_w )) && item="${item[1,$max_w]}..."
-    if (( i == _live_idx )); then
+    if (( i == _termpeek_idx )); then
       out+=$'\n'"▶ [$i] $item  (Tab: complete | Enter: run | Esc: close)"
     else
       out+=$'\n'"  [$i] $item"
