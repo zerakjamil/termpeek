@@ -10,6 +10,7 @@ echo "Installing termpeek to $INSTALL_DIR..."
 
 mkdir -p "$INSTALL_DIR"
 cp -r "$(dirname "$0")/"* "$INSTALL_DIR/"
+chmod +x "$INSTALL_DIR/bin/termpeek-worker" 2>/dev/null || true
 
 if ! grep -q "termpeek.zsh" "$ZSHRC" 2>/dev/null; then
   echo "" >> "$ZSHRC"

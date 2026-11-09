@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""
+termpeek-worker: High-performance asynchronous query and scoring worker for termpeek.
+Communicates with Zsh via non-blocking pipes/FIFOs.
+"""
+
+import os
+import sys
+import signal
+import sqlite3
+import re
+import json
+
+CURATED_RECIPES = [
+    "tar -czvf archive.tar.gz <folder>",
+    "tar -xzvf archive.tar.gz",
+    "rsync -avz --progress <src>/ <dest>/",
+    "ffmpeg -i input.mp4 -c:v libx264 -crf 23 output.mp4",
+    "ffmpeg -i input.mp4 -vn -c:a copy output.aac",
+    "find . -type f -name '*.log' -delete",
+    "find . -type f -size +100M",
+    "docker stop $(docker ps -aq)",
+    "docker system prune -a --volumes",
+    "git log --oneline --graph --decorate --all",
+    "git commit --amend --no-edit",
+    "git reset --soft HEAD~1",
+    "curl -fsSL <url> | bash",
+    "chmod +x <file>",
+    "python3 -m http.server 8000",
+    "lsof -i :8000",
+    "kill -9 $(lsof -t -i :8000)",
+    "grep -rnw . -e 'pattern'",
+    "ssh -i ~/.ssh/key.pem user@host",
+    "du -sh * | sort -hr",
+]
+
+SECRET_PATTERNS = [
+    (re.compile(r"(sk-[a-zA-Z0-9_\-]{4})[a-zA-Z0-9_\-]+"), r"\1****[REDACTED]"),
+    (re.compile(r"(gh[po]_[a-zA-Z0-9]{4})[a-zA-Z0-9]+"), r"\1****[REDACTED]"),
+    (re.compile(r"(Bearer )[a-zA-Z0-9_\.\-]{8,}"), r"\1****[REDACTED]"),
+    (re.compile(r"(AKIA[0-9A-Z]{4})[0-9A-Z]+"), r"\1****[REDACTED]"),
+    (re.compile(r"((?:password|token|secret)=)[^\s&\"'`]+"), r"\1****[REDACTED]"),
+]
+
+SECRET_CHECK = re.compile(r"(sk-|ghp_|gho_|github_pat_|Bearer|AKIA|password=|token=|secret=)")
+
+DANGEROUS_PATTERNS = [
+    re.compile(r"^rm\s+.*-[a-zA-Z0-9]*r"),
+    re.compile(r"^rm\s+.*--recursive"),
+    re.compile(r"^rm\s+.*-[a-zA-Z0-9]*f"),
+    re.compile(r"^git\s+reset\s+--hard"),
+    re.compile(r"^git\s+clean\s+.*-[a-zA-Z0-9]*f"),
+    re.compile(r"^git\s+branch\s+-D"),
+    re.compile(r"^git\s+push\s+.*--force"),
+    re.compile(r"^git\s+push\s+.*-f(\s|$)"),
+    re.compile(r"^git\s+push\s+.*\+.*:"),
+    re.compile(r"^git\s+checkout\s+--\s+\."),
+    re.compile(r"^git\s+restore\s+\."),
+    re.compile(r"^kubectl\s+delete"),
+    re.compile(r"^helm\s+uninstall"),
+    re.compile(r"^docker\s+system\s+prune"),
+    re.compile(r"^docker\s+rm\s+.*-[a-zA-Z0-9]*f"),
+    re.compile(r"(drop\s+database|drop\s+table)", re.IGNORECASE),
+    re.compile(r"^(mkfs|dd\s+if=)"),
+    re.compile(r"^(killall\s+|kill\s+-9\s+-1)"),
+    re.compile(r"^chmod\s+.*-R\s+777"),
+]
+
+
+class QueryWorker:
+    def __init__(self):
+        self.db_path = os.path.expanduser("~/.local/share/atuin/history.db")
+        self.zsh_history_path = os.path.expanduser("~/.zsh_history")
+        self.conn = None
+        self._init_db()
+
+        self.project_cache_dir = None
+        self.project_tasks = []
+        self.git_root_cache = {}
+        self.query_cache = {}
+
+        # Config flags (overridden by environment)
+        self.max_results = int(os.environ.get("TERMPEEK_MAX_RESULTS", "4"))
+        self.only_successful = int(os.environ.get("TERMPEEK_ONLY_SUCCESSFUL", "1"))
+        self.recipes_enabled = int(os.environ.get("TERMPEEK_RECIPES", "1"))
+        self.project_tasks_enabled = int(os.environ.get("TERMPEEK_PROJECT_TASKS", "1"))
+        self.safety_guard_enabled = int(os.environ.get("TERMPEEK_SAFETY_GUARD", "1"))
+        self.mask_secrets_enabled = int(os.environ.get("TERMPEEK_MASK_SECRETS", "1"))
+
+    def _init_db(self):
+        if os.path.isfile(self.db_path):
+            try:
+                uri = f"file:{self.db_path}?mode=ro"
+                self.conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                self.conn.execute("PRAGMA query_only = ON;")
+                self.conn.execute("PRAGMA mmap_size = 268435456;")
+                self.conn.execute("PRAGMA temp_store = MEMORY;")
+                self.conn.execute("PRAGMA cache_size = -64000;")
+                cur = self.conn.cursor()
+                cur.execute("SELECT command FROM history LIMIT 1;")
+                cur.fetchall()
+            except Exception:
+                self.conn = None
+
+    def get_git_root(self, cwd):
+        if cwd in self.git_root_cache:
+            return self.git_root_cache[cwd]
+
+        curr = cwd
+        while curr and curr != "/":
+            if os.path.isdir(os.path.join(curr, ".git")):
+                self.git_root_cache[cwd] = curr
+                return curr
+            parent = os.path.dirname(curr)
+            if parent == curr:
+                break
+            curr = parent
+        self.git_root_cache[cwd] = ""
+        return ""
+
+    def load_project_tasks(self, cwd):
+        if not self.project_tasks_enabled:
+            self.project_tasks = []
+            return
+
+        if self.project_cache_dir == cwd:
+            return
+
+        self.project_cache_dir = cwd
+        tasks = []
+
+        # package.json
+        pkg_json = os.path.join(cwd, "package.json")
+        if os.path.isfile(pkg_json):
+            try:
+                with open(pkg_json, "r", encoding="utf-8", errors="ignore") as f:
+                    data = json.load(f)
+                    scripts = data.get("scripts", {})
+                    runner = "npm"
+                    if os.path.isfile(os.path.join(cwd, "pnpm-lock.yaml")):
+                        runner = "pnpm"
+                    elif os.path.isfile(os.path.join(cwd, "yarn.lock")):
+                        runner = "yarn"
+                    elif os.path.isfile(os.path.join(cwd, "bun.lockb")) or os.path.isfile(os.path.join(cwd, "bun.lock")):
+                        runner = "bun"
+
+                    for name in scripts:
+                        if runner == "npm" and name in ("test", "start"):
+                            tasks.append(f"npm {name}")
+                        else:
+                            tasks.append(f"{runner} run {name}")
+            except Exception:
+                pass
+
+        # Makefile
+        for make_name in ("Makefile", "makefile"):
+            make_path = os.path.join(cwd, make_name)
+            if os.path.isfile(make_path):
+                try:
+                    with open(make_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            m = re.match(r"^([a-zA-Z0-9_\-]+):", line)
+                            if m:
+                                target = m.group(1)
+                                if target not in (".PHONY", "all"):
+                                    tasks.append(f"make {target}")
+                except Exception:
+                    pass
+                break
+
+        # Cargo.toml
+        if os.path.isfile(os.path.join(cwd, "Cargo.toml")):
+            tasks.extend(["cargo build", "cargo test", "cargo run", "cargo check"])
+
+        # Docker compose
+        if os.path.isfile(os.path.join(cwd, "docker-compose.yml")) or os.path.isfile(os.path.join(cwd, "compose.yaml")):
+            tasks.extend(["docker compose up", "docker compose down", "docker compose ps"])
+
+        # Python
+        if any(os.path.isfile(os.path.join(cwd, x)) for x in ("pyproject.toml", "Pipfile", "requirements.txt")):
+            tasks.extend(["pytest", "ruff check ."])
+
+        self.project_tasks = tasks
+
+    def is_dangerous(self, cmd):
+        if not self.safety_guard_enabled:
+            return False
+        for pat in DANGEROUS_PATTERNS:
+            if pat.search(cmd):
+                return True
+        return False
+
+    def check_and_mask_secret(self, cmd):
+        if not self.mask_secrets_enabled:
+            return False, cmd
+        if not SECRET_CHECK.search(cmd):
+            return False, cmd
+
+        is_secret = False
+        masked = cmd
+        for pat, repl in SECRET_PATTERNS:
+            new_val = pat.sub(repl, masked)
+            if new_val != masked:
+                is_secret = True
+                masked = new_val
+        return is_secret, masked
+
+    def query(self, query_id, cwd, buffer_text):
+        trimmed = buffer_text.strip()
+        if len(trimmed) < 2:
+            return f"{query_id}\t0"
+
+        cache_key = (cwd, trimmed)
+        if cache_key in self.query_cache:
+            matches = self.query_cache[cache_key]
+            parts = [str(query_id), str(len(matches))]
+            for clean, tag_str, is_danger, display_str in matches:
+                parts.extend([clean, tag_str, str(is_danger), display_str])
+            return "\t".join(parts)
+
+        self.load_project_tasks(cwd)
+        git_root = self.get_git_root(cwd)
+
+        matches = []
+        seen = set()
+
+        def add_candidate(raw_cmd, tag=""):
+            clean = raw_cmd.replace("\r", "").replace("\n", " && ").strip()
+            if not clean or clean == trimmed or clean in seen:
+                return False
+            seen.add(clean)
+            is_danger = 1 if self.is_dangerous(clean) else 0
+            is_secret, display_str = self.check_and_mask_secret(clean)
+            tags = []
+            if tag:
+                tags.append(tag)
+            if is_danger:
+                tags.append("[DANGER]")
+            if is_secret:
+                tags.append("[SECRET]")
+            tag_str = " ".join(tags)
+            matches.append((clean, tag_str, is_danger, display_str))
+            return True
+
+        lower_trim = trimmed.lower()
+
+        # Step 1: Project tasks
+        for task in self.project_tasks:
+            if lower_trim in task.lower():
+                add_candidate(task, "[project]")
+                if len(matches) >= self.max_results:
+                    break
+
+        # Step 2: History (Atuin SQLite or fallback)
+        if len(matches) < self.max_results and self.conn:
+            try:
+                escaped = trimmed.replace('"', '""')
+                pwd_esc = cwd.replace('"', '""')
+                git_esc = git_root.replace('"', '""') if git_root else ""
+
+                exit_clause = "AND (exit <= 0)" if self.only_successful else ""
+                git_clause = f'CASE WHEN cwd LIKE "{git_esc}%" THEN 432000 ELSE 0 END' if git_esc else "0"
+
+                sql = f"""
+                    SELECT command
+                    FROM history
+                    WHERE command LIKE "%{escaped}%" AND deleted_at IS NULL {exit_clause}
+                    GROUP BY command
+                    ORDER BY ((CASE WHEN cwd = "{pwd_esc}" THEN 864000 ELSE {git_clause} END) +
+                              (count(*) * 86400) +
+                              (max(timestamp) / 1000000000)) DESC
+                    LIMIT {self.max_results * 2};
+                """
+                cur = self.conn.cursor()
+                cur.execute(sql)
+                rows = cur.fetchall()
+                for (row_cmd,) in rows:
+                    add_candidate(row_cmd)
+                    if len(matches) >= self.max_results:
+                        break
+            except Exception:
+                pass
+
+        # Step 3: Recipes fallback
+        if self.recipes_enabled and len(matches) < self.max_results:
+            for recipe in CURATED_RECIPES:
+                if lower_trim in recipe.lower():
+                    add_candidate(recipe, "[recipe]")
+                    if len(matches) >= self.max_results:
+                        break
+
+        if len(self.query_cache) > 256:
+            self.query_cache.clear()
+        self.query_cache[cache_key] = matches
+
+        # Build response line:
+        # QUERY_ID \t COUNT \t CMD1 \t TAG1 \t DANGER1 \t DISPLAY1 ...
+        parts = [str(query_id), str(len(matches))]
+        for clean, tag_str, is_danger, display_str in matches:
+            parts.extend([clean, tag_str, str(is_danger), display_str])
+
+        return "\t".join(parts)
+
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+    signal.signal(signal.SIGHUP, lambda s, f: sys.exit(0))
+
+    worker = QueryWorker()
+
+    in_f = sys.stdin
+    out_f = sys.stdout
+
+    if len(sys.argv) >= 3:
+        in_path = sys.argv[1]
+        out_path = sys.argv[2]
+        try:
+            in_f = open(in_path, "r", encoding="utf-8", errors="ignore")
+            out_f = open(out_path, "w", encoding="utf-8", errors="ignore")
+        except Exception:
+            sys.exit(1)
+
+    while True:
+        try:
+            line = in_f.readline()
+            if not line:
+                break
+            line = line.rstrip("\r\n")
+            if line == "QUIT":
+                break
+            if not line:
+                continue
+
+            fields = line.split("\t")
+            if len(fields) >= 3:
+                qid, cwd, buf = fields[0], fields[1], fields[2]
+                resp = worker.query(qid, cwd, buf)
+                out_f.write(resp + "\n")
+                out_f.flush()
+        except (BrokenPipeError, IOError):
+            break
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
