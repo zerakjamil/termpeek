@@ -30,26 +30,27 @@ Traditional shell plugins fork subshells or run database commands synchronously 
 - **Frecency weighting**: Blends frequency and recency scoring so commands you run often stay near the top without burying your newest runs.
 - **Exit-code filtering**: Ignores commands that failed with non-zero exit codes by default, keeping mistyped syntax and typos out of your suggestions.
 - **Recipe cheatsheets (`[recipe]`)**: When your history has fewer matches than your display limit, common syntax templates (like `tar`, `rsync`, `ffmpeg`, `docker`, `find`, `curl`, `chmod`, `lsof`) fill the remaining slots.
-- **Non-destructive browsing**: Moving through suggestions with Down and Up arrow keys never replaces what you typed. Your prompt stays clean, and your undo history stays intact.
-- **Dual completion keys**:
-  - Press **Tab** to fill the prompt with the currently highlighted command (or the top match if none is highlighted).
-  - Press **Right Arrow (`→`)** to immediately fill the prompt with the **first command on the list**, even if you have navigated down.
+- **Clean, distraction-free UI**: Compact layout with dim index numbers, colored badges (`[project]`, `[DANGER]`, `[SECRET]`, `[recipe]`), and an active selection pointer. No noisy hint blocks cluttering your terminal.
+- **Inline autosuggestion friendly**: Coexists cleanly with `zsh-autosuggestions`. Right Arrow accepts inline ghost text by default; Tab triggers standard tab completion. Termpeek only fills the command line when you deliberately press Down Arrow to select an item.
+- **Non-destructive browsing**: Moving through suggestions with Down and Up arrow keys never replaces what you typed until you explicitly select or confirm. Your prompt and undo history stay intact.
 - **Enter to run**: Pressing Enter on a highlighted safe suggestion runs it immediately. If nothing is highlighted, it runs what you typed.
 - **Escape to dismiss**: Pressing Escape hides suggestions so you can keep typing without distraction.
 - **Normal history untouched**: When your prompt is empty or no suggestions are highlighted, Up and Down arrows work as standard shell history navigation.
 
 ## Controls
 
-| Key | Action |
-| :--- | :--- |
-| **Type (2+ chars)** | Searches history asynchronously and displays matches below the prompt |
-| **Down Arrow (`↓`)** | Move pointer down through suggestions |
-| **Up Arrow (`↑`)** | Move pointer up through suggestions (returns to shell history at top) |
-| **Tab** | Fill prompt with highlighted command to edit (or top match if none highlighted) |
-| **Right Arrow (`→`)** | Fill prompt with the first command on the list |
-| **Enter** | Run highlighted safe command immediately (loads dangerous command for review) |
-| **Escape** | Close suggestions and keep typing |
-| **Up Arrow (empty prompt)** | Standard shell history |
+| Key | State | Action |
+| :--- | :--- | :--- |
+| **Type (2+ chars)** | Any | Searches history asynchronously and displays matches below the prompt |
+| **Right Arrow (`→`)** | Unselected (`idx = 0`) | Accepts inline autosuggestion (`zsh-autosuggestions`) or moves cursor forward |
+| **Tab** | Unselected (`idx = 0`) | Standard Zsh tab completion (`expand-or-complete`) |
+| **Down Arrow (`↓`)** | Suggestions open | Enters selection mode and moves pointer down |
+| **Up Arrow (`↑`)** | In selection (`idx > 0`) | Moves pointer up (returns to prompt when at top) |
+| **Tab / Right Arrow** | Selected (`idx > 0`) | Fills prompt with highlighted command |
+| **Enter** | Selected (`idx > 0`) | Runs highlighted safe command (loads dangerous command for review) |
+| **Enter** | Unselected (`idx = 0`) | Runs what you typed on the prompt line |
+| **Escape** | Any | Closes suggestions immediately |
+| **Up Arrow** | Empty prompt | Standard shell history |
 
 ## Configuration
 

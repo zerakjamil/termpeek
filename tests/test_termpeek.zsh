@@ -50,7 +50,7 @@ _termpeek_tab
 [[ "$BUFFER" == "item two" && ${#_termpeek_matches[@]} -eq 0 && $_termpeek_idx -eq 0 ]] || { print "FAIL: Tab completion of highlighted item failed"; exit 1; }
 print "PASS: Tab completes highlighted item"
 
-# Test 6: Tab completion with no item highlighted completes first item
+# Test 6: Tab with no selection preserves BUFFER for standard tab completion
 BUFFER="orig"
 _termpeek_matches=("first item" "second item")
 _termpeek_tags=("" "")
@@ -58,10 +58,10 @@ _termpeek_dangers=(0 0)
 _termpeek_displays=("first item" "second item")
 _termpeek_idx=0
 _termpeek_tab
-[[ "$BUFFER" == "first item" && ${#_termpeek_matches[@]} -eq 0 ]] || { print "FAIL: Tab default completion failed"; exit 1; }
-print "PASS: Tab with no selection completes first item"
+[[ "$BUFFER" == "orig" ]] || { print "FAIL: Tab with no selection trampled BUFFER: $BUFFER"; exit 1; }
+print "PASS: Tab with no selection leaves BUFFER intact for standard completion"
 
-# Test 7: Right arrow ALWAYS completes the first item even when item 2 is highlighted
+# Test 7: Right arrow with highlighted item completes the highlighted item
 BUFFER="cur"
 CURSOR=3
 _termpeek_matches=("first item" "second item" "third item")
@@ -70,8 +70,20 @@ _termpeek_dangers=(0 0 0)
 _termpeek_displays=("first item" "second item" "third item")
 _termpeek_idx=2
 _termpeek_right
-[[ "$BUFFER" == "first item" && ${#_termpeek_matches[@]} -eq 0 ]] || { print "FAIL: Right arrow did not complete first item"; exit 1; }
-print "PASS: Right arrow always completes first item regardless of selection"
+[[ "$BUFFER" == "second item" && ${#_termpeek_matches[@]} -eq 0 ]] || { print "FAIL: Right arrow failed to complete selected item"; exit 1; }
+print "PASS: Right arrow completes highlighted item"
+
+# Test 7b: Right arrow with no selection preserves BUFFER for inline autosuggestion
+BUFFER="cd work"
+CURSOR=7
+_termpeek_matches=("cd workspace && xserver" "cd workspace && codex")
+_termpeek_tags=("" "")
+_termpeek_dangers=(0 0)
+_termpeek_displays=("cd workspace && xserver" "cd workspace && codex")
+_termpeek_idx=0
+_termpeek_right
+[[ "$BUFFER" == "cd work" ]] || { print "FAIL: Right arrow trampled inline autosuggestion: $BUFFER"; exit 1; }
+print "PASS: Right arrow with no selection leaves inline autosuggestion intact"
 
 # Test 8: Right arrow when cursor is not at end of buffer does not complete
 BUFFER="hello world"

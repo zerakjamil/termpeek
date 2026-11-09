@@ -51,60 +51,56 @@ _termpeek_clear_display() {
 
 _termpeek_render_display() {
   local total=${#_termpeek_matches[@]}
-  local seq=$'\e7'
-
-  # Clear previously drawn lines
-  if (( _termpeek_lines_drawn > 0 )); then
-    local c
-    for (( c=1; c<=_termpeek_lines_drawn; c++ )); do
-      seq+=$'\r\n\e[2K'
-    done
-    seq+=$'\e8\e7'
-  fi
-
-  if (( total == 0 )); then
-    if (( _termpeek_lines_drawn > 0 )); then
-      seq+=$'\e8'
-      print -n -u 2 -- "$seq"
-      _termpeek_lines_drawn=0
-    fi
-    return 0
-  fi
 
   # Respect terminal boundary limits
   local term_lines=${LINES:-24}
   local max_allowed=$(( term_lines > 4 ? term_lines - 2 : 2 ))
   (( total > max_allowed )) && total=$max_allowed
 
+  if (( total == 0 && _termpeek_lines_drawn == 0 )); then
+    return 0
+  fi
+
+  local seq=$'\e7'
+  local max_drawn=$total
+  (( _termpeek_lines_drawn > max_drawn )) && max_drawn=$_termpeek_lines_drawn
+
   local pointer="${TERMPEEK_POINTER:-▶}"
-  local show_hints=${TERMPEEK_SHOW_HINTS:-1}
-  local max_w=$(( COLUMNS > 25 ? COLUMNS - 12 : 65 ))
+  local max_w=$(( COLUMNS > 25 ? COLUMNS - 14 : 65 ))
 
   local i
-  for (( i=1; i<=total; i++ )); do
-    local raw_cmd="${_termpeek_matches[$i]}"
-    local tag="${_termpeek_tags[$i]}"
-    local is_danger="${_termpeek_dangers[$i]}"
-    local display_cmd="${_termpeek_displays[$i]}"
+  for (( i=1; i<=max_drawn; i++ )); do
+    if (( i <= total )); then
+      local raw_cmd="${_termpeek_matches[$i]}"
+      local tag="${_termpeek_tags[$i]}"
+      local is_danger="${_termpeek_dangers[$i]}"
+      local display_cmd="${_termpeek_displays[$i]}"
 
-    (( $#display_cmd > max_w )) && display_cmd="${display_cmd[1,$max_w]}..."
-    [[ -n "$tag" ]] && tag="  $tag"
+      (( $#display_cmd > max_w )) && display_cmd="${display_cmd[1,$max_w]}..."
 
-    local hint=""
-    if (( i == _termpeek_idx )); then
-      if (( show_hints == 1 )); then
-        if (( is_danger == 1 )); then
-          hint="  (Tab: edit | Enter: review | Esc: close)"
+      local styled_tag=""
+      if [[ -n "$tag" ]]; then
+        if [[ "$tag" == *"[DANGER]"* ]]; then
+          styled_tag=$' \e[1;31m[DANGER]\e[0m'
+        elif [[ "$tag" == *"[SECRET]"* ]]; then
+          styled_tag=$' \e[33m[SECRET]\e[0m'
+        elif [[ "$tag" == *"[project]"* ]]; then
+          styled_tag=$' \e[36m[project]\e[0m'
+        elif [[ "$tag" == *"[recipe]"* ]]; then
+          styled_tag=$' \e[35m[recipe]\e[0m'
         else
-          hint="  (Tab: selected | →: first | Enter: run | Esc: close)"
+          styled_tag="  $tag"
         fi
       fi
-      seq+=$'\r\n\e[2K'"$pointer [$i] $display_cmd$tag$hint"
-    else
-      if (( i == 1 && _termpeek_idx == 0 && show_hints == 1 )); then
-        hint="  (→: first | Tab: complete)"
+
+      if (( i == _termpeek_idx )); then
+        seq+=$'\r\n\e[2K'$'\e[1;34m'"$pointer"$'\e[0m \e[1m'"$i"$'\e[0m  \e[1m'"$display_cmd"$'\e[0m'"$styled_tag"
+      else
+        seq+=$'\r\n\e[2K  \e[2m'"$i"$'\e[0m  '"$display_cmd$styled_tag"
       fi
-      seq+=$'\r\n\e[2K'"  [$i] $display_cmd$tag$hint"
+    else
+      # Blank out trailing lines from previous render
+      seq+=$'\r\n\e[2K'
     fi
   done
 
@@ -216,15 +212,11 @@ _termpeek_up() {
   [[ -o zle ]] && zle .up-line-or-history
 }
 
-# Tab completion: fills selected (or first) item
+# Tab completion: fills selected item if actively navigating, else normal tab completion
 _termpeek_tab() {
-  if (( ${#_termpeek_matches[@]} > 0 )); then
+  if (( ${#_termpeek_matches[@]} > 0 && _termpeek_idx > 0 )); then
     _termpeek_clear_display
-    if (( _termpeek_idx > 0 )); then
-      BUFFER="${_termpeek_matches[$_termpeek_idx]}"
-    else
-      BUFFER="${_termpeek_matches[1]}"
-    fi
+    BUFFER="${_termpeek_matches[$_termpeek_idx]}"
     CURSOR=$#BUFFER
     _termpeek_matches=()
     _termpeek_idx=0
@@ -235,16 +227,22 @@ _termpeek_tab() {
   [[ -o zle ]] && zle expand-or-complete
 }
 
-# Right Arrow: always completes first item
+# Right Arrow: fills selected item if actively navigating, else accepts inline autosuggestion
 _termpeek_right() {
-  if (( CURSOR == $#BUFFER && ${#_termpeek_matches[@]} > 0 )); then
+  if (( CURSOR == $#BUFFER && ${#_termpeek_matches[@]} > 0 && _termpeek_idx > 0 )); then
     _termpeek_clear_display
-    BUFFER="${_termpeek_matches[1]}"
+    BUFFER="${_termpeek_matches[$_termpeek_idx]}"
     CURSOR=$#BUFFER
     _termpeek_matches=()
     _termpeek_idx=0
     _termpeek_last_buf="$BUFFER"
     [[ -o zle ]] && zle -R
+    return 0
+  fi
+
+  # Pass through to inline autosuggestion accept if available, else standard forward-char
+  if (( $+widgets[autosuggest-accept] )); then
+    [[ -o zle ]] && zle autosuggest-accept
     return 0
   fi
   [[ -o zle ]] && zle .forward-char

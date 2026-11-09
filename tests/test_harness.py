@@ -193,9 +193,17 @@ def run_tests():
         # -------------------------------------------------------------
         print("\n--- Test 2: Keystroke-to-Redraw Latency Benchmark ---")
 
-        # Warm up query
+        # Warm up query and PTY pipe
         term.write(b"git ")
         time.sleep(0.08)
+        term.drain()
+
+        # Warm up redraw cycle
+        term.write(b"s")
+        time.sleep(0.05)
+        term.drain()
+        term.write(b"\x7f")
+        time.sleep(0.02)
         term.drain()
 
         latencies = []
@@ -208,7 +216,7 @@ def run_tests():
             received = b""
             arrived = False
             while time.perf_counter() < deadline:
-                r, _, _ = select.select([term.master], [], [], 0.005)
+                r, _, _ = select.select([term.master], [], [], 0.0005)
                 if r:
                     try:
                         c = os.read(term.master, 1024)
