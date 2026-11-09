@@ -35,6 +35,27 @@ typeset -gi _termpeek_in_fd=0
 typeset -gi _termpeek_out_fd=0
 typeset -gi _termpeek_worker_pid=0
 
+# Coexistence with zsh-autosuggestions: protect widgets from being wrapped
+typeset -ga ZSH_AUTOSUGGEST_IGNORE_WIDGETS
+ZSH_AUTOSUGGEST_IGNORE_WIDGETS+=('_termpeek_*' 'termpeek-*')
+
+# Clear inline autosuggestion extension (POSTDISPLAY) and pending async requests
+_termpeek_clear_autosuggest() {
+  POSTDISPLAY=""
+  if (( $+_ZSH_AUTOSUGGEST_LAST_HIGHLIGHT )) && [[ -n "$_ZSH_AUTOSUGGEST_LAST_HIGHLIGHT" ]]; then
+    region_highlight=("${(@)region_highlight:#$_ZSH_AUTOSUGGEST_LAST_HIGHLIGHT}")
+    unset _ZSH_AUTOSUGGEST_LAST_HIGHLIGHT
+  fi
+  if (( $+widgets[autosuggest-clear] )); then
+    [[ -o zle ]] && zle autosuggest-clear
+  fi
+  if [[ -n "$_ZSH_AUTOSUGGEST_ASYNC_FD" ]] && { true <&$_ZSH_AUTOSUGGEST_ASYNC_FD } 2>/dev/null; then
+    builtin exec {_ZSH_AUTOSUGGEST_ASYNC_FD}<&- 2>/dev/null
+    [[ -o zle ]] && zle -F $_ZSH_AUTOSUGGEST_ASYNC_FD 2>/dev/null
+    _ZSH_AUTOSUGGEST_ASYNC_FD=
+  fi
+}
+
 # Clean display engine
 _termpeek_clear_display() {
   if (( _termpeek_lines_drawn > 0 )); then
@@ -186,6 +207,7 @@ _termpeek_down() {
     else
       _termpeek_idx=1
     fi
+    _termpeek_clear_autosuggest
     _termpeek_render_display
     [[ -o zle ]] && zle -R
     return 0
@@ -197,12 +219,16 @@ _termpeek_down() {
 _termpeek_up() {
   if (( ${#_termpeek_matches[@]} > 0 && _termpeek_idx > 1 )); then
     (( _termpeek_idx-- ))
+    _termpeek_clear_autosuggest
     _termpeek_render_display
     [[ -o zle ]] && zle -R
     return 0
   elif (( ${#_termpeek_matches[@]} > 0 && _termpeek_idx == 1 )); then
     _termpeek_idx=0
     _termpeek_render_display
+    if (( $+widgets[autosuggest-fetch] )); then
+      [[ -o zle ]] && zle autosuggest-fetch
+    fi
     [[ -o zle ]] && zle -R
     return 0
   fi
@@ -218,6 +244,7 @@ _termpeek_tab() {
     _termpeek_clear_display
     BUFFER="${_termpeek_matches[$_termpeek_idx]}"
     CURSOR=$#BUFFER
+    _termpeek_clear_autosuggest
     _termpeek_matches=()
     _termpeek_idx=0
     _termpeek_last_buf="$BUFFER"
@@ -233,6 +260,7 @@ _termpeek_right() {
     _termpeek_clear_display
     BUFFER="${_termpeek_matches[$_termpeek_idx]}"
     CURSOR=$#BUFFER
+    _termpeek_clear_autosuggest
     _termpeek_matches=()
     _termpeek_idx=0
     _termpeek_last_buf="$BUFFER"
@@ -256,6 +284,7 @@ _termpeek_enter() {
     local is_danger="${_termpeek_dangers[$_termpeek_idx]}"
     BUFFER="$target"
     CURSOR=$#BUFFER
+    _termpeek_clear_autosuggest
     _termpeek_matches=()
     _termpeek_idx=0
     _termpeek_last_buf="$BUFFER"
@@ -268,6 +297,7 @@ _termpeek_enter() {
       return 0
     fi
   else
+    _termpeek_clear_autosuggest
     _termpeek_matches=()
     _termpeek_idx=0
     _termpeek_last_buf=""
@@ -282,6 +312,7 @@ _termpeek_enter() {
 _termpeek_escape() {
   if (( _termpeek_lines_drawn > 0 || ${#_termpeek_matches[@]} > 0 )); then
     _termpeek_clear_display
+    _termpeek_clear_autosuggest
     _termpeek_matches=()
     _termpeek_idx=0
     _termpeek_dismissed_buf="$BUFFER"

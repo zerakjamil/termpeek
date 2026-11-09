@@ -39,16 +39,17 @@ _termpeek_up
 [[ "$BUFFER" == "test_cmd" && $_termpeek_idx -eq 0 ]] || { print "FAIL: Up arrow bad index"; exit 1; }
 print "PASS: Up arrow decrements pointer without mutating BUFFER"
 
-# Test 5: Tab completion with highlighted item completes the highlighted item
+# Test 5: Tab completion with highlighted item completes the highlighted item and clears POSTDISPLAY
 BUFFER="orig"
+POSTDISPLAY="stale ghost text"
 _termpeek_matches=("item one" "item two" "item three")
 _termpeek_tags=("" "" "")
 _termpeek_dangers=(0 0 0)
 _termpeek_displays=("item one" "item two" "item three")
 _termpeek_idx=2
 _termpeek_tab
-[[ "$BUFFER" == "item two" && ${#_termpeek_matches[@]} -eq 0 && $_termpeek_idx -eq 0 ]] || { print "FAIL: Tab completion of highlighted item failed"; exit 1; }
-print "PASS: Tab completes highlighted item"
+[[ "$BUFFER" == "item two" && -z "$POSTDISPLAY" && ${#_termpeek_matches[@]} -eq 0 && $_termpeek_idx -eq 0 ]] || { print "FAIL: Tab completion of highlighted item failed (POSTDISPLAY: $POSTDISPLAY)"; exit 1; }
+print "PASS: Tab completes highlighted item and clears inline autosuggestion"
 
 # Test 6: Tab with no selection preserves BUFFER for standard tab completion
 BUFFER="orig"
@@ -61,17 +62,18 @@ _termpeek_tab
 [[ "$BUFFER" == "orig" ]] || { print "FAIL: Tab with no selection trampled BUFFER: $BUFFER"; exit 1; }
 print "PASS: Tab with no selection leaves BUFFER intact for standard completion"
 
-# Test 7: Right arrow with highlighted item completes the highlighted item
+# Test 7: Right arrow with highlighted item completes the highlighted item and clears POSTDISPLAY
 BUFFER="cur"
 CURSOR=3
+POSTDISPLAY="stale ghost text"
 _termpeek_matches=("first item" "second item" "third item")
 _termpeek_tags=("" "" "")
 _termpeek_dangers=(0 0 0)
 _termpeek_displays=("first item" "second item" "third item")
 _termpeek_idx=2
 _termpeek_right
-[[ "$BUFFER" == "second item" && ${#_termpeek_matches[@]} -eq 0 ]] || { print "FAIL: Right arrow failed to complete selected item"; exit 1; }
-print "PASS: Right arrow completes highlighted item"
+[[ "$BUFFER" == "second item" && -z "$POSTDISPLAY" && ${#_termpeek_matches[@]} -eq 0 ]] || { print "FAIL: Right arrow failed to complete selected item"; exit 1; }
+print "PASS: Right arrow completes highlighted item and clears inline autosuggestion"
 
 # Test 7b: Right arrow with no selection preserves BUFFER for inline autosuggestion
 BUFFER="cd work"
@@ -107,16 +109,17 @@ _termpeek_escape
 [[ "$BUFFER" == "my_query" && "$_termpeek_dismissed_buf" == "my_query" && ${#_termpeek_matches[@]} -eq 0 ]] || { print "FAIL: Escape failed"; exit 1; }
 print "PASS: Escape closes menu and preserves prompt"
 
-# Test 10: Enter on normal command executes
+# Test 10: Enter on normal command executes and clears POSTDISPLAY
 BUFFER="orig"
+POSTDISPLAY="stale ghost text"
 _termpeek_matches=("first item" "normal command")
 _termpeek_tags=("" "")
 _termpeek_dangers=(0 0)
 _termpeek_displays=("first item" "normal command")
 _termpeek_idx=2
 _termpeek_enter
-[[ "$BUFFER" == "normal command" ]] || { print "FAIL: Normal enter failed"; exit 1; }
-print "PASS: Enter selects normal command"
+[[ "$BUFFER" == "normal command" && -z "$POSTDISPLAY" ]] || { print "FAIL: Normal enter failed"; exit 1; }
+print "PASS: Enter selects normal command and clears inline autosuggestion"
 
 # Test 11: Worker recipe fallback
 local worker_resp=$(print -r -- "1"$'\t'"$PWD"$'\t'"ffmpeg" | "$WORKER_BIN")

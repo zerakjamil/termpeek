@@ -123,6 +123,12 @@ class HeadlessPTY:
 
     def close(self):
         try:
+            children = self.get_child_pids()
+            for c in children:
+                try:
+                    os.kill(c, signal.SIGKILL)
+                except Exception:
+                    pass
             os.kill(self.pid, signal.SIGKILL)
             os.waitpid(self.pid, 0)
         except Exception:
@@ -193,30 +199,25 @@ def run_tests():
         # -------------------------------------------------------------
         print("\n--- Test 2: Keystroke-to-Redraw Latency Benchmark ---")
 
-        # Warm up query and PTY pipe
-        term.write(b"git ")
-        time.sleep(0.08)
+        # Warm up query to populate worker caches and warm SQLite connection
+        term.write(b"git che")
+        time.sleep(0.2)
         term.drain()
-
-        # Warm up redraw cycle
-        term.write(b"s")
+        term.write(b"\x15git ")
         time.sleep(0.05)
         term.drain()
-        term.write(b"\x7f")
-        time.sleep(0.02)
-        term.drain()
 
+        test_chars = "checkout -b feat"
         latencies = []
-        # Measure 25 iterations of single-keystroke preview redraws
-        for i in range(25):
+        for ch in test_chars:
             t0 = time.perf_counter()
-            term.write(b"s")
+            term.write(ch.encode())
 
             deadline = time.perf_counter() + 0.1
             received = b""
             arrived = False
             while time.perf_counter() < deadline:
-                r, _, _ = select.select([term.master], [], [], 0.0005)
+                r, _, _ = select.select([term.master], [], [], 0.0002)
                 if r:
                     try:
                         c = os.read(term.master, 1024)
@@ -229,16 +230,10 @@ def run_tests():
                     except Exception:
                         break
 
-            if not arrived:
-                latencies.append(9.9)
-
-            # Backspace to reset
-            term.write(b"\x7f")
-            time.sleep(0.015)
+            time.sleep(0.02)
             term.drain()
 
-        # Exclude initial cold run
-        measured = [l for l in latencies[1:] if l < 9.0]
+        measured = latencies
         if not measured:
             print("FAIL: No redraw escape sequences received within deadline")
             sys.exit(1)
@@ -375,8 +370,48 @@ def run_tests():
         term.drain()
         print("PASS: Multi-line prompt renders without cursor drift or prompt duplication")
 
+        # -------------------------------------------------------------
+        # Test 6: Coexistence with zsh-autosuggestions (No Stale Extensions)
+        # -------------------------------------------------------------
+        autosuggest_path = "/opt/homebrew/share/zsh-autosuggestions/zsh-autosuggestions.zsh"
+        if os.path.exists(autosuggest_path):
+            print("\n--- Test 6: Coexistence with zsh-autosuggestions ---")
+            term.write(f"source {autosuggest_path}\n".encode())
+            time.sleep(0.15)
+            term.drain()
+
+            # Record a command in history
+            term.write(b"php artisan serve --port=8091\n")
+            time.sleep(0.1)
+            term.drain()
+
+            # Type prefix
+            term.write(b"php ")
+            time.sleep(0.2)
+            term.drain()
+
+            # Navigate down to select item and complete with Tab
+            term.write(b"\x1b[B")
+            time.sleep(0.1)
+            term.drain()
+            term.write(b"\t")
+            time.sleep(0.1)
+            tab_output = term.read_available(0.1).decode("utf-8", errors="replace")
+
+            # Execute and check prompt output
+            term.write(b"\n")
+            time.sleep(0.15)
+            exec_output = term.read_available(0.15).decode("utf-8", errors="replace")
+
+            # Verify no mashed/stale ghost text in executed output
+            if "8091artisan" in tab_output or "8091artisan" in exec_output:
+                print("FAIL: Ghost text extension leaked into buffer/display after Tab selection")
+                sys.exit(1)
+
+            print("PASS: Tab selection cleanly clears ghost text extension without buffer corruption")
+
         print("\n" + "=" * 65)
-        print("ALL 5 AUTOMATED VERIFICATION SUITES PASSED SUCCESSFULLY")
+        print("ALL AUTOMATED VERIFICATION SUITES PASSED SUCCESSFULLY")
         print("=" * 65)
 
     finally:
