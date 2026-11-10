@@ -200,14 +200,14 @@ def run_tests():
         print("\n--- Test 2: Keystroke-to-Redraw Latency Benchmark ---")
 
         # Warm up query to populate worker caches and warm SQLite connection
-        term.write(b"git che")
+        term.write(b"git log")
         time.sleep(0.2)
         term.drain()
         term.write(b"\x15git ")
         time.sleep(0.05)
         term.drain()
 
-        test_chars = "checkout -b feat"
+        test_chars = "log --one"
         latencies = []
         for ch in test_chars:
             t0 = time.perf_counter()

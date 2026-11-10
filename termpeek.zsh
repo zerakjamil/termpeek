@@ -62,7 +62,7 @@ _termpeek_clear_display() {
     local seq=$'\e7'
     local i
     for (( i=1; i<=_termpeek_lines_drawn; i++ )); do
-      seq+=$'\r\n\e[2K'
+      seq+=$'\e[1E\e[2K'
     done
     seq+=$'\e8'
     print -n -u 2 -- "$seq"
@@ -72,15 +72,19 @@ _termpeek_clear_display() {
 
 _termpeek_render_display() {
   local total=${#_termpeek_matches[@]}
+  local buf="${BUFFER:-$_termpeek_last_buf}"
+  local trimmed="${buf## #}"
+  trimmed="${trimmed%% #}"
+
+  if [[ ${#trimmed} -lt 2 || "$buf" == "$_termpeek_dismissed_buf" || total == 0 ]]; then
+    _termpeek_clear_display
+    return 0
+  fi
 
   # Respect terminal boundary limits
   local term_lines=${LINES:-24}
   local max_allowed=$(( term_lines > 4 ? term_lines - 2 : 2 ))
   (( total > max_allowed )) && total=$max_allowed
-
-  if (( total == 0 && _termpeek_lines_drawn == 0 )); then
-    return 0
-  fi
 
   local seq=$'\e7'
   local max_drawn=$total
@@ -115,13 +119,13 @@ _termpeek_render_display() {
       fi
 
       if (( i == _termpeek_idx )); then
-        seq+=$'\r\n\e[2K'$'\e[1;34m'"$pointer"$'\e[0m \e[1m'"$i"$'\e[0m  \e[1m'"$display_cmd"$'\e[0m'"$styled_tag"
+        seq+=$'\e[1E\e[2K'$'\e[1;34m'"$pointer"$'\e[0m \e[1m'"$i"$'\e[0m  \e[1m'"$display_cmd"$'\e[0m'"$styled_tag"
       else
-        seq+=$'\r\n\e[2K  \e[2m'"$i"$'\e[0m  '"$display_cmd$styled_tag"
+        seq+=$'\e[1E\e[2K  \e[2m'"$i"$'\e[0m  '"$display_cmd$styled_tag"
       fi
     else
-      # Blank out trailing lines from previous render
-      seq+=$'\r\n\e[2K'
+      # Blank out trailing lines from previous render if fewer lines now
+      seq+=$'\e[1E\e[2K'
     fi
   done
 
@@ -140,66 +144,91 @@ _termpeek_async_callback() {
   fi
 
   local line=""
-  read -r -u $fd line || return 0
-  [[ -z "$line" ]] && return 0
+  while (( 1 )); do
+    if ! read -r -u $fd line; then
+      return 0
+    fi
+    [[ -z "$line" ]] && return 0
 
-  local -a parts=("${(@ps:\t:)line}")
-  local resp_qid="${parts[1]}"
+    local -a parts=("${(@ps:\t:)line}")
+    local resp_qid="${parts[1]}"
 
-  # Discard stale query responses
-  if (( resp_qid != _termpeek_qid )); then
-    return 0
-  fi
+    # If this response matches our current active query, process it
+    if (( resp_qid == _termpeek_qid )); then
+      local buf="${BUFFER:-$_termpeek_last_buf}"
+      local trimmed="${buf## #}"
+      trimmed="${trimmed%% #}"
+      if [[ ${#trimmed} -lt 2 ]]; then
+        _termpeek_clear_display
+        return 0
+      fi
 
-  local count="${parts[2]}"
-  _termpeek_matches=()
-  _termpeek_tags=()
-  _termpeek_dangers=()
-  _termpeek_displays=()
+      local count="${parts[2]}"
+      _termpeek_matches=()
+      _termpeek_tags=()
+      _termpeek_dangers=()
+      _termpeek_displays=()
 
-  if (( count > 0 )); then
-    local i idx
-    for (( i=1; i<=count; i++ )); do
-      idx=$(( 3 + (i-1)*4 ))
-      _termpeek_matches+=("${parts[$idx]}")
-      _termpeek_tags+=("${parts[$((idx+1))]}")
-      _termpeek_dangers+=("${parts[$((idx+2))]}")
-      _termpeek_displays+=("${parts[$((idx+3))]}")
-    done
-  fi
+      if (( count > 0 )); then
+        local i idx
+        for (( i=1; i<=count; i++ )); do
+          idx=$(( 3 + (i-1)*4 ))
+          _termpeek_matches+=("${parts[$idx]}")
+          _termpeek_tags+=("${parts[$((idx+1))]}")
+          _termpeek_dangers+=("${parts[$((idx+2))]}")
+          _termpeek_displays+=("${parts[$((idx+3))]}")
+        done
+      fi
 
-  _termpeek_idx=0
-  _termpeek_render_display
-  zle -R
+      _termpeek_idx=0
+      _termpeek_render_display
+      zle -R
+      return 0
+    fi
+
+    # Stale query response: if more data is immediately ready in FIFO, consume next
+    if (( $+modules[zsh/zselect] )) || zmodload zsh/zselect 2>/dev/null; then
+      zselect -r $fd -t 0 2>/dev/null || break
+    else
+      break
+    fi
+  done
 }
 
 # Keystroke hook: 0 forks, 0 subshells, non-blocking query write
 _termpeek_pre_redraw() {
-  if [[ "$BUFFER" != "$_termpeek_last_buf" ]]; then
-    _termpeek_last_buf="$BUFFER"
+  local current="$BUFFER"
 
-    local trimmed="${BUFFER## #}"
-    trimmed="${trimmed%% #}"
+  # No-op if buffer hasn't changed
+  if [[ "$current" == "$_termpeek_last_buf" ]]; then
+    return 0
+  fi
 
-    (( _termpeek_qid++ ))
+  # Invalidate previous query immediately so in-flight responses are dropped
+  (( _termpeek_qid++ ))
+  _termpeek_last_buf="$current"
 
-    if [[ ${#trimmed} -lt 2 || "$BUFFER" == "$_termpeek_dismissed_buf" ]]; then
-      _termpeek_clear_display
-      _termpeek_matches=()
-      _termpeek_idx=0
-      return 0
-    fi
+  local trimmed="${current## #}"
+  trimmed="${trimmed%% #}"
 
-    _termpeek_dismissed_buf=""
+  # Clear display if buffer is empty or 1 character
+  if [[ ${#trimmed} -lt 2 || "$current" == "$_termpeek_dismissed_buf" ]]; then
+    _termpeek_clear_display
+    _termpeek_matches=()
+    _termpeek_tags=()
+    _termpeek_dangers=()
+    _termpeek_displays=()
+    _termpeek_idx=0
+    return 0
+  fi
 
-    # Non-blocking write to worker FIFO via builtin print
-    if (( _termpeek_in_fd > 0 )); then
-      print -u $_termpeek_in_fd -r -- "$_termpeek_qid"$'\t'"$PWD"$'\t'"$BUFFER" 2>/dev/null
-    fi
+  # Dispatch query to background worker via non-blocking FIFO write (0 forks)
+  if (( _termpeek_in_fd > 0 )); then
+    print -u $_termpeek_in_fd -r -- "$_termpeek_qid"$'\t'"$PWD"$'\t'"$current" 2>/dev/null
   fi
 }
 
-# Navigation: Down Arrow
+# Arrow Down: navigate down suggestion list
 _termpeek_down() {
   if (( ${#_termpeek_matches[@]} > 0 )); then
     if (( _termpeek_idx < ${#_termpeek_matches[@]} )); then
@@ -215,7 +244,7 @@ _termpeek_down() {
   [[ -o zle ]] && zle .down-line-or-history
 }
 
-# Navigation: Up Arrow
+# Arrow Up: navigate up suggestion list
 _termpeek_up() {
   if (( ${#_termpeek_matches[@]} > 0 && _termpeek_idx > 1 )); then
     (( _termpeek_idx-- ))
@@ -232,9 +261,6 @@ _termpeek_up() {
     [[ -o zle ]] && zle -R
     return 0
   fi
-  _termpeek_clear_display
-  _termpeek_matches=()
-  _termpeek_idx=0
   [[ -o zle ]] && zle .up-line-or-history
 }
 
@@ -246,8 +272,12 @@ _termpeek_tab() {
     CURSOR=$#BUFFER
     _termpeek_clear_autosuggest
     _termpeek_matches=()
+    _termpeek_tags=()
+    _termpeek_dangers=()
+    _termpeek_displays=()
     _termpeek_idx=0
     _termpeek_last_buf="$BUFFER"
+    _termpeek_dismissed_buf=""
     [[ -o zle ]] && zle -R
     return 0
   fi
@@ -262,8 +292,12 @@ _termpeek_right() {
     CURSOR=$#BUFFER
     _termpeek_clear_autosuggest
     _termpeek_matches=()
+    _termpeek_tags=()
+    _termpeek_dangers=()
+    _termpeek_displays=()
     _termpeek_idx=0
     _termpeek_last_buf="$BUFFER"
+    _termpeek_dismissed_buf=""
     [[ -o zle ]] && zle -R
     return 0
   fi
@@ -279,29 +313,37 @@ _termpeek_right() {
 # Enter: execute or review destructive command
 _termpeek_enter() {
   _termpeek_clear_display
+  _termpeek_clear_autosuggest
+  (( _termpeek_qid++ ))
   if (( ${#_termpeek_matches[@]} > 0 && _termpeek_idx > 0 )); then
     local target="${_termpeek_matches[$_termpeek_idx]}"
     local is_danger="${_termpeek_dangers[$_termpeek_idx]}"
     BUFFER="$target"
     CURSOR=$#BUFFER
-    _termpeek_clear_autosuggest
     _termpeek_matches=()
+    _termpeek_tags=()
+    _termpeek_dangers=()
+    _termpeek_displays=()
     _termpeek_idx=0
     _termpeek_last_buf="$BUFFER"
     _termpeek_dismissed_buf=""
+    _termpeek_lines_drawn=0
 
     if (( is_danger == 1 )); then
-      print -n -u 2 -- $'\e7\r\n\e[2K⚠️  [DANGER GUARD] Destructive command loaded to prompt for review. Press Enter to run.\e8'
+      print -n -u 2 -- $'\e7\e[1E\e[2K⚠️  [DANGER GUARD] Destructive command loaded to prompt for review. Press Enter to run.\e8'
       _termpeek_lines_drawn=1
       [[ -o zle ]] && zle -R
       return 0
     fi
   else
-    _termpeek_clear_autosuggest
     _termpeek_matches=()
+    _termpeek_tags=()
+    _termpeek_dangers=()
+    _termpeek_displays=()
     _termpeek_idx=0
     _termpeek_last_buf=""
     _termpeek_dismissed_buf=""
+    _termpeek_lines_drawn=0
   fi
 
   [[ -o zle ]] && zle -R
@@ -310,25 +352,33 @@ _termpeek_enter() {
 
 # Escape: dismiss preview immediately
 _termpeek_escape() {
-  if (( _termpeek_lines_drawn > 0 || ${#_termpeek_matches[@]} > 0 )); then
-    _termpeek_clear_display
-    _termpeek_clear_autosuggest
-    _termpeek_matches=()
-    _termpeek_idx=0
-    _termpeek_dismissed_buf="$BUFFER"
-    [[ -o zle ]] && zle -R
-    return 0
-  fi
+  _termpeek_clear_display
+  _termpeek_clear_autosuggest
+  (( _termpeek_qid++ ))
+  _termpeek_matches=()
+  _termpeek_tags=()
+  _termpeek_dangers=()
+  _termpeek_displays=()
+  _termpeek_idx=0
+  _termpeek_dismissed_buf="$BUFFER"
+  _termpeek_lines_drawn=0
+  [[ -o zle ]] && zle -R
   return 0
 }
 
 # Cancel: Ctrl+C / Ctrl+G
 _termpeek_cancel() {
   _termpeek_clear_display
+  _termpeek_clear_autosuggest
+  (( _termpeek_qid++ ))
   _termpeek_matches=()
+  _termpeek_tags=()
+  _termpeek_dangers=()
+  _termpeek_displays=()
   _termpeek_idx=0
   _termpeek_last_buf=""
   _termpeek_dismissed_buf=""
+  _termpeek_lines_drawn=0
   [[ -o zle ]] && zle -R
   [[ -o zle ]] && zle .send-break
 }
@@ -336,12 +386,28 @@ _termpeek_cancel() {
 # Lifecycle hooks
 _termpeek_preexec() {
   _termpeek_clear_display
+  _termpeek_clear_autosuggest
+  (( _termpeek_qid++ ))
+  _termpeek_matches=()
+  _termpeek_tags=()
+  _termpeek_dangers=()
+  _termpeek_displays=()
+  _termpeek_idx=0
+  _termpeek_lines_drawn=0
 }
 
 _termpeek_precmd() {
   _termpeek_clear_display
+  _termpeek_clear_autosuggest
+  (( _termpeek_qid++ ))
+  _termpeek_matches=()
+  _termpeek_tags=()
+  _termpeek_dangers=()
+  _termpeek_displays=()
+  _termpeek_idx=0
   _termpeek_last_buf=""
   _termpeek_dismissed_buf=""
+  _termpeek_lines_drawn=0
 }
 
 # Handle terminal resize
