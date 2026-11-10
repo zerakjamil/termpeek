@@ -6,6 +6,7 @@ Communicates with Zsh via non-blocking pipes/FIFOs.
 
 import os
 import sys
+import time
 import signal
 import sqlite3
 import re
@@ -78,6 +79,8 @@ class QueryWorker:
         self.project_tasks = []
         self.git_root_cache = {}
         self.query_cache = {}
+        self.history_cache = []
+        self.last_history_refresh = 0.0
 
         # Config flags (overridden by environment)
         self.max_results = int(os.environ.get("TERMPEEK_MAX_RESULTS", "4"))
@@ -86,6 +89,8 @@ class QueryWorker:
         self.project_tasks_enabled = int(os.environ.get("TERMPEEK_PROJECT_TASKS", "1"))
         self.safety_guard_enabled = int(os.environ.get("TERMPEEK_SAFETY_GUARD", "1"))
         self.mask_secrets_enabled = int(os.environ.get("TERMPEEK_MASK_SECRETS", "1"))
+
+        self._refresh_history_cache()
 
     def _init_db(self):
         if os.path.isfile(self.db_path):
@@ -101,6 +106,28 @@ class QueryWorker:
                 cur.fetchall()
             except Exception:
                 self.conn = None
+
+    def _refresh_history_cache(self):
+        now = time.time()
+        if now - self.last_history_refresh < 3.0:
+            return
+        self.last_history_refresh = now
+        if not self.conn:
+            return
+        try:
+            exit_clause = "AND exit <= 0" if self.only_successful else ""
+            sql = f"""
+                SELECT command, cwd, timestamp
+                FROM history
+                WHERE deleted_at IS NULL {exit_clause}
+                ORDER BY timestamp DESC
+                LIMIT 5000;
+            """
+            cur = self.conn.cursor()
+            cur.execute(sql)
+            self.history_cache = cur.fetchall()
+        except Exception:
+            pass
 
     def get_git_root(self, cwd):
         if cwd in self.git_root_cache:
@@ -251,35 +278,27 @@ class QueryWorker:
                 if len(matches) >= self.max_results:
                     break
 
-        # Step 2: History (Atuin SQLite or fallback)
-        if len(matches) < self.max_results and self.conn:
-            try:
-                escaped = trimmed.replace('"', '""')
-                pwd_esc = cwd.replace('"', '""')
-                git_esc = git_root.replace('"', '""') if git_root else ""
-
-                exit_clause = "AND (exit <= 0)" if self.only_successful else ""
-                git_clause = f'CASE WHEN cwd LIKE "{git_esc}%" THEN 432000 ELSE 0 END' if git_esc else "0"
-
-                sql = f"""
-                    SELECT command
-                    FROM history
-                    WHERE command LIKE "%{escaped}%" AND deleted_at IS NULL {exit_clause}
-                    GROUP BY command
-                    ORDER BY ((CASE WHEN cwd = "{pwd_esc}" THEN 864000 ELSE {git_clause} END) +
-                              (count(*) * 86400) +
-                              (max(timestamp) / 1000000000)) DESC
-                    LIMIT {self.max_results * 2};
-                """
-                cur = self.conn.cursor()
-                cur.execute(sql)
-                rows = cur.fetchall()
-                for (row_cmd,) in rows:
-                    add_candidate(row_cmd)
-                    if len(matches) >= self.max_results:
+        # Step 2: History (in-memory fast search over warm cache)
+        self._refresh_history_cache()
+        if len(matches) < self.max_results and self.history_cache:
+            lower_trimmed = trimmed.lower()
+            scored_rows = []
+            for row_cmd, row_cwd, ts in self.history_cache:
+                if lower_trimmed in row_cmd.lower():
+                    score = ts
+                    if row_cwd == cwd:
+                        score += 1000000000000
+                    elif git_root and row_cwd and row_cwd.startswith(git_root):
+                        score += 500000000000
+                    scored_rows.append((score, row_cmd))
+                    if len(scored_rows) >= 30:
                         break
-            except Exception:
-                pass
+
+            scored_rows.sort(key=lambda x: x[0], reverse=True)
+            for _, row_cmd in scored_rows:
+                add_candidate(row_cmd)
+                if len(matches) >= self.max_results:
+                    break
 
         # Step 3: Recipes fallback
         if self.recipes_enabled and len(matches) < self.max_results:

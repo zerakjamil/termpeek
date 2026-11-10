@@ -46,12 +46,14 @@ _termpeek_clear_autosuggest() {
     region_highlight=("${(@)region_highlight:#$_ZSH_AUTOSUGGEST_LAST_HIGHLIGHT}")
     unset _ZSH_AUTOSUGGEST_LAST_HIGHLIGHT
   fi
-  if (( $+widgets[autosuggest-clear] )); then
-    [[ -o zle ]] && zle autosuggest-clear
+  if [[ -n "$WIDGET" ]] && (( $+widgets[autosuggest-clear] )); then
+    zle autosuggest-clear 2>/dev/null
   fi
   if [[ -n "$_ZSH_AUTOSUGGEST_ASYNC_FD" ]] && { true <&$_ZSH_AUTOSUGGEST_ASYNC_FD } 2>/dev/null; then
     builtin exec {_ZSH_AUTOSUGGEST_ASYNC_FD}<&- 2>/dev/null
-    [[ -o zle ]] && zle -F $_ZSH_AUTOSUGGEST_ASYNC_FD 2>/dev/null
+    if [[ -n "$WIDGET" ]]; then
+      zle -F $_ZSH_AUTOSUGGEST_ASYNC_FD 2>/dev/null
+    fi
     _ZSH_AUTOSUGGEST_ASYNC_FD=
   fi
 }
@@ -386,7 +388,6 @@ _termpeek_cancel() {
 # Lifecycle hooks
 _termpeek_preexec() {
   _termpeek_clear_display
-  _termpeek_clear_autosuggest
   (( _termpeek_qid++ ))
   _termpeek_matches=()
   _termpeek_tags=()
@@ -398,7 +399,6 @@ _termpeek_preexec() {
 
 _termpeek_precmd() {
   _termpeek_clear_display
-  _termpeek_clear_autosuggest
   (( _termpeek_qid++ ))
   _termpeek_matches=()
   _termpeek_tags=()

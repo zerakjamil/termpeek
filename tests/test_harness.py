@@ -207,7 +207,7 @@ def run_tests():
         time.sleep(0.05)
         term.drain()
 
-        test_chars = "log --one"
+        test_chars = "log --oneline --graph"
         latencies = []
         for ch in test_chars:
             t0 = time.perf_counter()
@@ -217,14 +217,16 @@ def run_tests():
             received = b""
             arrived = False
             while time.perf_counter() < deadline:
-                r, _, _ = select.select([term.master], [], [], 0.0002)
+                rem = max(0.0001, deadline - time.perf_counter())
+                r, _, _ = select.select([term.master], [], [], min(0.005, rem))
                 if r:
                     try:
                         c = os.read(term.master, 1024)
                         if c:
                             received += c
                             if b"\x1b7" in received:
-                                latencies.append((time.perf_counter() - t0) * 1000)
+                                lat = (time.perf_counter() - t0) * 1000
+                                latencies.append(lat)
                                 arrived = True
                                 break
                     except Exception:
@@ -409,6 +411,33 @@ def run_tests():
                 sys.exit(1)
 
             print("PASS: Tab selection cleanly clears ghost text extension without buffer corruption")
+
+        # -------------------------------------------------------------
+        # Test 7: Foreground Command SIGINT (Ctrl+C) and Prompt Recovery
+        # -------------------------------------------------------------
+        print("\n--- Test 7: Foreground Command SIGINT (Ctrl+C) and Prompt Recovery ---")
+        # Run a foreground sleep command
+        term.write(b"sleep 5\n")
+        time.sleep(0.15)
+        # Send SIGINT (Ctrl+C)
+        term.write(b"\x03")
+        time.sleep(0.2)
+        sigint_output = term.read_available(0.2).decode("utf-8", errors="replace")
+
+        # Verify no precmd/ZLE errors occurred
+        if "widgets can only be called when ZLE is active" in sigint_output:
+            print("FAIL: Precmd invoked ZLE widget while ZLE was inactive")
+            sys.exit(1)
+
+        # Verify typing works immediately on the restored prompt
+        term.write(b"echo prompt_recovered\n")
+        time.sleep(0.2)
+        exec_recovery = term.read_available(0.2).decode("utf-8", errors="replace")
+        if "prompt_recovered" not in exec_recovery:
+            print("FAIL: Prompt was not responsive after foreground Ctrl+C")
+            sys.exit(1)
+
+        print("PASS: SIGINT on running command restored prompt cleanly without ZLE errors")
 
         print("\n" + "=" * 65)
         print("ALL AUTOMATED VERIFICATION SUITES PASSED SUCCESSFULLY")
