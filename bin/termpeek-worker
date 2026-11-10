@@ -67,6 +67,15 @@ DANGEROUS_PATTERNS = [
     re.compile(r"^chmod\s+.*-R\s+777"),
 ]
 
+DANGEROUS_COMBINED = re.compile(
+    r"^rm\s+.*-[a-zA-Z0-9]*[rf]|^rm\s+.*--recursive|^git\s+reset\s+--hard|"
+    r"^git\s+clean\s+.*-[a-zA-Z0-9]*f|^git\s+branch\s+-D|^git\s+push\s+.*(?:--force|-f(\s|$))|"
+    r"^git\s+push\s+.*\+.*:|^git\s+checkout\s+--\s+\.|^git\s+restore\s+\.|"
+    r"^kubectl\s+delete|^helm\s+uninstall|^docker\s+system\s+prune|^docker\s+rm\s+.*-[a-zA-Z0-9]*f|"
+    r"(?:drop\s+database|drop\s+table)|^(?:mkfs|dd\s+if=)|^(?:killall\s+|kill\s+-9\s+-1)|^chmod\s+.*-R\s+777",
+    re.IGNORECASE
+)
+
 
 class QueryWorker:
     def __init__(self):
@@ -109,7 +118,7 @@ class QueryWorker:
 
     def _refresh_history_cache(self):
         now = time.time()
-        if now - self.last_history_refresh < 3.0:
+        if self.history_cache and (now - self.last_history_refresh < 30.0):
             return
         self.last_history_refresh = now
         if not self.conn:
@@ -121,11 +130,12 @@ class QueryWorker:
                 FROM history
                 WHERE deleted_at IS NULL {exit_clause}
                 ORDER BY timestamp DESC
-                LIMIT 5000;
+                LIMIT 3000;
             """
             cur = self.conn.cursor()
             cur.execute(sql)
-            self.history_cache = cur.fetchall()
+            rows = cur.fetchall()
+            self.history_cache = [(cmd, cmd.lower(), cwd, ts) for cmd, cwd, ts in rows]
         except Exception:
             pass
 
@@ -212,10 +222,7 @@ class QueryWorker:
     def is_dangerous(self, cmd):
         if not self.safety_guard_enabled:
             return False
-        for pat in DANGEROUS_PATTERNS:
-            if pat.search(cmd):
-                return True
-        return False
+        return bool(DANGEROUS_COMBINED.search(cmd))
 
     def check_and_mask_secret(self, cmd):
         if not self.mask_secrets_enabled:
@@ -283,8 +290,8 @@ class QueryWorker:
         if len(matches) < self.max_results and self.history_cache:
             lower_trimmed = trimmed.lower()
             scored_rows = []
-            for row_cmd, row_cwd, ts in self.history_cache:
-                if lower_trimmed in row_cmd.lower():
+            for row_cmd, row_cmd_lower, row_cwd, ts in self.history_cache:
+                if lower_trimmed in row_cmd_lower:
                     score = ts
                     if row_cwd == cwd:
                         score += 1000000000000

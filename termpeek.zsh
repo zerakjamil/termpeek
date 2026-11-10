@@ -26,6 +26,9 @@ typeset -ga _termpeek_displays
 typeset -gi _termpeek_idx=0
 typeset -gi _termpeek_lines_drawn=0
 typeset -gi _termpeek_qid=0
+typeset -g _termpeek_last_dir="down"
+typeset -gi _termpeek_prompt_row=24
+typeset -gi _termpeek_just_cleared=0
 
 typeset -g _termpeek_last_buf=""
 typeset -g _termpeek_dismissed_buf=""
@@ -63,9 +66,16 @@ _termpeek_clear_display() {
   if (( _termpeek_lines_drawn > 0 )); then
     local seq=$'\e7'
     local i
-    for (( i=1; i<=_termpeek_lines_drawn; i++ )); do
-      seq+=$'\e[1E\e[2K'
-    done
+    if [[ "$_termpeek_last_dir" == "up" ]]; then
+      seq+=$'\e['${_termpeek_lines_drawn}'A\r\e[2K'
+      for (( i=2; i<=_termpeek_lines_drawn; i++ )); do
+        seq+=$'\e[1E\e[2K'
+      done
+    else
+      for (( i=1; i<=_termpeek_lines_drawn; i++ )); do
+        seq+=$'\e[1E\e[2K'
+      done
+    fi
     seq+=$'\e8'
     print -n -u 2 -- "$seq"
     _termpeek_lines_drawn=0
@@ -88,52 +98,107 @@ _termpeek_render_display() {
   local max_allowed=$(( term_lines > 4 ? term_lines - 2 : 2 ))
   (( total > max_allowed )) && total=$max_allowed
 
-  local seq=$'\e7'
   local max_drawn=$total
   (( _termpeek_lines_drawn > max_drawn )) && max_drawn=$_termpeek_lines_drawn
 
+  # Determine layout direction: render upward if near bottom boundary
+  local dir="${TERMPEEK_DIRECTION:-auto}"
+  if [[ "$dir" == "auto" ]]; then
+    local available=$(( term_lines - _termpeek_prompt_row ))
+    if (( available < max_drawn )); then
+      dir="up"
+    else
+      dir="down"
+    fi
+  fi
+
+  # If direction changed while lines were drawn, clear previous direction first
+  if (( _termpeek_lines_drawn > 0 )) && [[ "$dir" != "$_termpeek_last_dir" ]]; then
+    _termpeek_clear_display
+  fi
+
   local pointer="${TERMPEEK_POINTER:-▶}"
   local max_w=$(( COLUMNS > 25 ? COLUMNS - 14 : 65 ))
-
+  local seq=$'\e7'
   local i
-  for (( i=1; i<=max_drawn; i++ )); do
-    if (( i <= total )); then
-      local raw_cmd="${_termpeek_matches[$i]}"
-      local tag="${_termpeek_tags[$i]}"
-      local is_danger="${_termpeek_dangers[$i]}"
-      local display_cmd="${_termpeek_displays[$i]}"
 
-      (( $#display_cmd > max_w )) && display_cmd="${display_cmd[1,$max_w]}..."
+  if [[ "$dir" == "up" ]]; then
+    seq+=$'\e['${max_drawn}'A'
+    for (( i=1; i<=max_drawn; i++ )); do
+      local line=""
+      if (( i <= total )); then
+        local display_cmd="${_termpeek_displays[$i]}"
+        (( $#display_cmd > max_w )) && display_cmd="${display_cmd[1,$max_w]}..."
 
-      local styled_tag=""
-      if [[ -n "$tag" ]]; then
-        if [[ "$tag" == *"[DANGER]"* ]]; then
-          styled_tag=$' \e[1;31m[DANGER]\e[0m'
-        elif [[ "$tag" == *"[SECRET]"* ]]; then
-          styled_tag=$' \e[33m[SECRET]\e[0m'
-        elif [[ "$tag" == *"[project]"* ]]; then
-          styled_tag=$' \e[36m[project]\e[0m'
-        elif [[ "$tag" == *"[recipe]"* ]]; then
-          styled_tag=$' \e[35m[recipe]\e[0m'
+        local tag="${_termpeek_tags[$i]}"
+        local styled_tag=""
+        if [[ -n "$tag" ]]; then
+          if [[ "$tag" == *"[DANGER]"* ]]; then
+            styled_tag=$' \e[1;31m[DANGER]\e[0m'
+          elif [[ "$tag" == *"[SECRET]"* ]]; then
+            styled_tag=$' \e[33m[SECRET]\e[0m'
+          elif [[ "$tag" == *"[project]"* ]]; then
+            styled_tag=$' \e[36m[project]\e[0m'
+          elif [[ "$tag" == *"[recipe]"* ]]; then
+            styled_tag=$' \e[35m[recipe]\e[0m'
+          else
+            styled_tag="  $tag"
+          fi
+        fi
+
+        if (( i == _termpeek_idx )); then
+          line=$'\e[1;34m'"$pointer"$'\e[0m \e[1m'"$i"$'\e[0m  \e[1m'"$display_cmd"$'\e[0m'"$styled_tag"
         else
-          styled_tag="  $tag"
+          line="  "$'\e[2m'"$i"$'\e[0m  '"$display_cmd$styled_tag"
         fi
       fi
 
-      if (( i == _termpeek_idx )); then
-        seq+=$'\e[1E\e[2K'$'\e[1;34m'"$pointer"$'\e[0m \e[1m'"$i"$'\e[0m  \e[1m'"$display_cmd"$'\e[0m'"$styled_tag"
+      if (( i == 1 )); then
+        seq+=$'\r\e[2K'"$line"
       else
-        seq+=$'\e[1E\e[2K  \e[2m'"$i"$'\e[0m  '"$display_cmd$styled_tag"
+        seq+=$'\e[1E\e[2K'"$line"
       fi
-    else
-      # Blank out trailing lines from previous render if fewer lines now
-      seq+=$'\e[1E\e[2K'
-    fi
-  done
+    done
+    seq+=$'\e8'
+    print -n -u 2 -- "$seq"
+    _termpeek_lines_drawn=$total
+    _termpeek_last_dir="up"
+  else
+    for (( i=1; i<=max_drawn; i++ )); do
+      local line=""
+      if (( i <= total )); then
+        local display_cmd="${_termpeek_displays[$i]}"
+        (( $#display_cmd > max_w )) && display_cmd="${display_cmd[1,$max_w]}..."
 
-  seq+=$'\e8'
-  print -n -u 2 -- "$seq"
-  _termpeek_lines_drawn=$total
+        local tag="${_termpeek_tags[$i]}"
+        local styled_tag=""
+        if [[ -n "$tag" ]]; then
+          if [[ "$tag" == *"[DANGER]"* ]]; then
+            styled_tag=$' \e[1;31m[DANGER]\e[0m'
+          elif [[ "$tag" == *"[SECRET]"* ]]; then
+            styled_tag=$' \e[33m[SECRET]\e[0m'
+          elif [[ "$tag" == *"[project]"* ]]; then
+            styled_tag=$' \e[36m[project]\e[0m'
+          elif [[ "$tag" == *"[recipe]"* ]]; then
+            styled_tag=$' \e[35m[recipe]\e[0m'
+          else
+            styled_tag="  $tag"
+          fi
+        fi
+
+        if (( i == _termpeek_idx )); then
+          line=$'\e[1;34m'"$pointer"$'\e[0m \e[1m'"$i"$'\e[0m  \e[1m'"$display_cmd"$'\e[0m'"$styled_tag"
+        else
+          line="  "$'\e[2m'"$i"$'\e[0m  '"$display_cmd$styled_tag"
+        fi
+      fi
+      seq+=$'\e[1E\e[2K'"$line"
+    done
+    seq+=$'\e8'
+    print -n -u 2 -- "$seq"
+    _termpeek_lines_drawn=$total
+    _termpeek_last_dir="down"
+  fi
 }
 
 # Asynchronous worker response handler (triggered by zle -F)
@@ -332,7 +397,13 @@ _termpeek_enter() {
     _termpeek_lines_drawn=0
 
     if (( is_danger == 1 )); then
-      print -n -u 2 -- $'\e7\e[1E\e[2K⚠️  [DANGER GUARD] Destructive command loaded to prompt for review. Press Enter to run.\e8'
+      local dseq=$'\e7'
+      if [[ "$_termpeek_last_dir" == "up" ]]; then
+        dseq+=$'\e[1A\r\e[2K⚠️  [DANGER GUARD] Destructive command loaded to prompt for review. Press Enter to run.\e8'
+      else
+        dseq+=$'\e[1E\e[2K⚠️  [DANGER GUARD] Destructive command loaded to prompt for review. Press Enter to run.\e8'
+      fi
+      print -n -u 2 -- "$dseq"
       _termpeek_lines_drawn=1
       [[ -o zle ]] && zle -R
       return 0
@@ -385,6 +456,14 @@ _termpeek_cancel() {
   [[ -o zle ]] && zle .send-break
 }
 
+_termpeek_update_cursor_row() {
+  if (( _termpeek_just_cleared == 1 )); then
+    _termpeek_prompt_row=1
+  else
+    _termpeek_prompt_row=${LINES:-24}
+  fi
+}
+
 # Lifecycle hooks
 _termpeek_preexec() {
   _termpeek_clear_display
@@ -395,6 +474,12 @@ _termpeek_preexec() {
   _termpeek_displays=()
   _termpeek_idx=0
   _termpeek_lines_drawn=0
+  local cmd="$1"
+  if [[ "$cmd" == "clear"* || "$cmd" == "reset"* || "$cmd" == "tput reset"* ]]; then
+    _termpeek_just_cleared=1
+  else
+    _termpeek_just_cleared=0
+  fi
 }
 
 _termpeek_precmd() {
@@ -408,11 +493,13 @@ _termpeek_precmd() {
   _termpeek_last_buf=""
   _termpeek_dismissed_buf=""
   _termpeek_lines_drawn=0
+  _termpeek_update_cursor_row
 }
 
 # Handle terminal resize
 TRAPWINCH() {
   _termpeek_clear_display
+  _termpeek_update_cursor_row
   if (( ${#_termpeek_matches[@]} > 0 )); then
     _termpeek_render_display
   fi
