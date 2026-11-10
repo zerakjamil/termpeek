@@ -27,8 +27,9 @@ typeset -gi _termpeek_idx=0
 typeset -gi _termpeek_lines_drawn=0
 typeset -gi _termpeek_qid=0
 typeset -g _termpeek_last_dir="down"
-typeset -gi _termpeek_prompt_row=24
+typeset -gi _termpeek_prompt_row=1
 typeset -gi _termpeek_just_cleared=0
+typeset -gi _termpeek_last_cmd_lines=0
 
 typeset -g _termpeek_last_buf=""
 typeset -g _termpeek_dismissed_buf=""
@@ -260,13 +261,12 @@ _termpeek_async_callback() {
       _termpeek_displays=()
 
       if (( count > 0 )); then
-        local i idx
-        for (( i=1; i<=count; i++ )); do
-          idx=$(( 3 + (i-1)*4 ))
-          _termpeek_matches+=("${parts[$idx]}")
-          _termpeek_tags+=("${parts[$((idx+1))]}")
-          _termpeek_dangers+=("${parts[$((idx+2))]}")
-          _termpeek_displays+=("${parts[$((idx+3))]}")
+        local -i pidx=3
+        repeat $count; do
+          _termpeek_matches+=("${parts[pidx++]}")
+          _termpeek_tags+=("${parts[pidx++]}")
+          _termpeek_dangers+=("${parts[pidx++]}")
+          _termpeek_displays+=("${parts[pidx++]}")
         done
       fi
 
@@ -358,16 +358,18 @@ _termpeek_up() {
 _termpeek_tab() {
   if (( ${#_termpeek_matches[@]} > 0 && _termpeek_idx > 0 )); then
     _termpeek_clear_display
-    BUFFER="${_termpeek_matches[$_termpeek_idx]}"
-    CURSOR=$#BUFFER
-    _termpeek_clear_autosuggest
+    local selected="${_termpeek_matches[$_termpeek_idx]}"
     _termpeek_matches=()
     _termpeek_tags=()
     _termpeek_dangers=()
     _termpeek_displays=()
     _termpeek_idx=0
+    _termpeek_clear_autosuggest
+    BUFFER="$selected"
+    CURSOR=$#BUFFER
     _termpeek_last_buf="$BUFFER"
-    _termpeek_dismissed_buf=""
+    _termpeek_dismissed_buf="$BUFFER"
+    POSTDISPLAY=""
     [[ -o zle ]] && zle -R
     return 0
   fi
@@ -378,16 +380,18 @@ _termpeek_tab() {
 _termpeek_right() {
   if (( CURSOR == $#BUFFER && ${#_termpeek_matches[@]} > 0 && _termpeek_idx > 0 )); then
     _termpeek_clear_display
-    BUFFER="${_termpeek_matches[$_termpeek_idx]}"
-    CURSOR=$#BUFFER
-    _termpeek_clear_autosuggest
+    local selected="${_termpeek_matches[$_termpeek_idx]}"
     _termpeek_matches=()
     _termpeek_tags=()
     _termpeek_dangers=()
     _termpeek_displays=()
     _termpeek_idx=0
+    _termpeek_clear_autosuggest
+    BUFFER="$selected"
+    CURSOR=$#BUFFER
     _termpeek_last_buf="$BUFFER"
-    _termpeek_dismissed_buf=""
+    _termpeek_dismissed_buf="$BUFFER"
+    POSTDISPLAY=""
     [[ -o zle ]] && zle -R
     return 0
   fi
@@ -408,16 +412,17 @@ _termpeek_enter() {
   if (( ${#_termpeek_matches[@]} > 0 && _termpeek_idx > 0 )); then
     local target="${_termpeek_matches[$_termpeek_idx]}"
     local is_danger="${_termpeek_dangers[$_termpeek_idx]}"
-    BUFFER="$target"
-    CURSOR=$#BUFFER
     _termpeek_matches=()
     _termpeek_tags=()
     _termpeek_dangers=()
     _termpeek_displays=()
     _termpeek_idx=0
+    BUFFER="$target"
+    CURSOR=$#BUFFER
     _termpeek_last_buf="$BUFFER"
-    _termpeek_dismissed_buf=""
+    _termpeek_dismissed_buf="$BUFFER"
     _termpeek_lines_drawn=0
+    POSTDISPLAY=""
 
     if (( is_danger == 1 )); then
       local dseq=$'\e7'
@@ -479,11 +484,25 @@ _termpeek_cancel() {
   [[ -o zle ]] && zle .send-break
 }
 
+typeset -gi _termpeek_cmd_count=0
+
 _termpeek_update_cursor_row() {
-  if (( _termpeek_just_cleared == 1 )); then
+  local term_lines=${LINES:-24}
+  if (( _termpeek_just_cleared == 1 || _termpeek_cmd_count == 0 )); then
     _termpeek_prompt_row=1
+    return
+  fi
+
+  # If multi-line commands or enough commands have run, the screen has scrolled to bottom
+  if (( _termpeek_cmd_count >= 3 )); then
+    _termpeek_prompt_row=$term_lines
   else
-    _termpeek_prompt_row=${LINES:-24}
+    local estimated=$(( _termpeek_cmd_count * 3 + 1 ))
+    if (( estimated >= term_lines )); then
+      _termpeek_prompt_row=$term_lines
+    else
+      _termpeek_prompt_row=$estimated
+    fi
   fi
 }
 
@@ -500,8 +519,18 @@ _termpeek_preexec() {
   local cmd="$1"
   if [[ "$cmd" == "clear"* || "$cmd" == "reset"* || "$cmd" == "tput reset"* ]]; then
     _termpeek_just_cleared=1
+    _termpeek_cmd_count=0
   else
     _termpeek_just_cleared=0
+    # Multi-line commands immediately scroll terminal to bottom row
+    if [[ "$cmd" == *"for "* || "$cmd" == *"while "* || "$cmd" == *"{1.."* || \
+          "$cmd" == *"xlan"* || "$cmd" == *"expo "* || "$cmd" == *"metro"* || \
+          "$cmd" == *"npm "* || "$cmd" == *"yarn "* || "$cmd" == *"pnpm "* || \
+          "$cmd" == *"docker "* || "$cmd" == *"git log"* || "$cmd" == *"git diff"* ]]; then
+      _termpeek_cmd_count=100
+    else
+      (( _termpeek_cmd_count++ ))
+    fi
   fi
 }
 
@@ -517,6 +546,14 @@ _termpeek_precmd() {
   _termpeek_dismissed_buf=""
   _termpeek_lines_drawn=0
   _termpeek_update_cursor_row
+}
+
+_termpeek_clear_screen() {
+  _termpeek_just_cleared=1
+  _termpeek_cmd_count=0
+  _termpeek_prompt_row=1
+  _termpeek_clear_display
+  zle .clear-screen
 }
 
 # Handle terminal resize
@@ -621,6 +658,7 @@ if [[ -o interactive ]] || [[ -t 0 ]] || (( $+widgets )); then
   zle -N _termpeek_escape_widget _termpeek_escape
   zle -N _termpeek_right_widget _termpeek_right
   zle -N _termpeek_cancel_widget _termpeek_cancel
+  zle -N _termpeek_clear_screen_widget _termpeek_clear_screen
 
   bindkey '^[[B' _termpeek_down_widget
   bindkey '^[OB' _termpeek_down_widget
@@ -635,6 +673,7 @@ if [[ -o interactive ]] || [[ -t 0 ]] || (( $+widgets )); then
   bindkey '^[OC' _termpeek_right_widget
   bindkey '^C' _termpeek_cancel_widget
   bindkey '^G' _termpeek_cancel_widget
+  bindkey '^L' _termpeek_clear_screen_widget
 
   # Universal terminfo keybindings (Linux console, Termux, rxvt, putty, xterm)
   if zmodload zsh/terminfo 2>/dev/null; then

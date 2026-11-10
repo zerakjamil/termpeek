@@ -87,6 +87,7 @@ class QueryWorker:
         self.project_cache_dir = None
         self.project_tasks = []
         self.git_root_cache = {}
+        self.meta_cache = {}
         self.query_cache = {}
         self.history_cache = []
         self.last_history_refresh = 0.0
@@ -329,11 +330,7 @@ class QueryWorker:
 
         cache_key = (cwd, trimmed)
         if cache_key in self.query_cache:
-            matches = self.query_cache[cache_key]
-            parts = [str(query_id), str(len(matches))]
-            for clean, tag_str, is_danger, display_str in matches:
-                parts.extend([clean, tag_str, str(is_danger), display_str])
-            return "\t".join(parts)
+            return f"{query_id}\t{self.query_cache[cache_key]}"
 
         self.load_project_tasks(cwd)
         git_root = self.get_git_root(cwd)
@@ -346,14 +343,21 @@ class QueryWorker:
             if not clean or clean == trimmed or clean in seen:
                 return False
             seen.add(clean)
-            is_danger = 1 if self.is_dangerous(clean) else 0
-            is_secret, display_str = self.check_and_mask_secret(clean)
+
+            if clean in self.meta_cache:
+                is_danger, display_str = self.meta_cache[clean]
+            else:
+                is_danger = 1 if self.is_dangerous(clean) else 0
+                _, display_str = self.check_and_mask_secret(clean)
+                if len(self.meta_cache) < 2048:
+                    self.meta_cache[clean] = (is_danger, display_str)
+
             tags = []
             if tag:
                 tags.append(tag)
             if is_danger:
                 tags.append("[DANGER]")
-            if is_secret:
+            if display_str != clean:
                 tags.append("[SECRET]")
             tag_str = " ".join(tags)
             matches.append((clean, tag_str, is_danger, display_str))
@@ -398,17 +402,17 @@ class QueryWorker:
                     if len(matches) >= self.max_results:
                         break
 
-        if len(self.query_cache) > 256:
-            self.query_cache.clear()
-        self.query_cache[cache_key] = matches
-
-        # Build response line:
-        # QUERY_ID \t COUNT \t CMD1 \t TAG1 \t DANGER1 \t DISPLAY1 ...
-        parts = [str(query_id), str(len(matches))]
+        # Build serialized response payload
+        parts = [str(len(matches))]
         for clean, tag_str, is_danger, display_str in matches:
             parts.extend([clean, tag_str, str(is_danger), display_str])
+        serialized_payload = "\t".join(parts)
 
-        return "\t".join(parts)
+        if len(self.query_cache) > 512:
+            self.query_cache.clear()
+        self.query_cache[cache_key] = serialized_payload
+
+        return f"{query_id}\t{serialized_payload}"
 
 
 def main():

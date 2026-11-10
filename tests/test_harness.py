@@ -218,7 +218,7 @@ def run_tests():
             arrived = False
             while time.perf_counter() < deadline:
                 rem = max(0.0001, deadline - time.perf_counter())
-                r, _, _ = select.select([term.master], [], [], min(0.005, rem))
+                r, _, _ = select.select([term.master], [], [], min(0.0005, rem))
                 if r:
                     try:
                         c = os.read(term.master, 1024)
