@@ -118,7 +118,8 @@ _termpeek_render_display() {
   fi
 
   local pointer="${TERMPEEK_POINTER:-▶}"
-  local max_w=$(( COLUMNS > 25 ? COLUMNS - 14 : 65 ))
+  local col_limit=${COLUMNS:-80}
+  local safe_w=$(( col_limit > 12 ? col_limit - 7 : 15 ))
   local seq=$'\e7'
   local i
 
@@ -128,9 +129,20 @@ _termpeek_render_display() {
       local line=""
       if (( i <= total )); then
         local display_cmd="${_termpeek_displays[$i]}"
-        (( $#display_cmd > max_w )) && display_cmd="${display_cmd[1,$max_w]}..."
-
         local tag="${_termpeek_tags[$i]}"
+
+        # Prevent line wrapping on narrow terminals (Termux on phones, split panes)
+        local tag_len=${#tag}
+        local avail_cmd_w=$safe_w
+        if (( tag_len > 0 )); then
+          avail_cmd_w=$(( safe_w - tag_len - 2 ))
+        fi
+        (( avail_cmd_w < 10 )) && avail_cmd_w=10
+        if (( $#display_cmd > avail_cmd_w )); then
+          local cut_len=$(( avail_cmd_w > 3 ? avail_cmd_w - 3 : avail_cmd_w ))
+          display_cmd="${display_cmd[1,$cut_len]}..."
+        fi
+
         local styled_tag=""
         if [[ -n "$tag" ]]; then
           if [[ "$tag" == *"[DANGER]"* ]]; then
@@ -168,9 +180,20 @@ _termpeek_render_display() {
       local line=""
       if (( i <= total )); then
         local display_cmd="${_termpeek_displays[$i]}"
-        (( $#display_cmd > max_w )) && display_cmd="${display_cmd[1,$max_w]}..."
-
         local tag="${_termpeek_tags[$i]}"
+
+        # Prevent line wrapping on narrow terminals (Termux on phones, split panes)
+        local tag_len=${#tag}
+        local avail_cmd_w=$safe_w
+        if (( tag_len > 0 )); then
+          avail_cmd_w=$(( safe_w - tag_len - 2 ))
+        fi
+        (( avail_cmd_w < 10 )) && avail_cmd_w=10
+        if (( $#display_cmd > avail_cmd_w )); then
+          local cut_len=$(( avail_cmd_w > 3 ? avail_cmd_w - 3 : avail_cmd_w ))
+          display_cmd="${display_cmd[1,$cut_len]}..."
+        fi
+
         local styled_tag=""
         if [[ -n "$tag" ]]; then
           if [[ "$tag" == *"[DANGER]"* ]]; then
@@ -526,24 +549,60 @@ _termpeek_init() {
   local worker_bin="$_TERMPEEK_ROOT/bin/termpeek-worker"
 
   if [[ ! -x "$worker_bin" ]]; then
-    chmod +x "$worker_bin" 2>/dev/null
+    chmod +x "$worker_bin" 2>/dev/null || true
   fi
 
-  local rundir="${XDG_RUNTIME_DIR:-/tmp}/termpeek-$UID"
-  mkdir -m 0700 -p "$rundir" 2>/dev/null
+  # Resolve writable runtime directory across Linux, macOS, Termux (Android), and Windows (WSL/MSYS2)
+  local base_tmp="${TMPDIR:-${XDG_RUNTIME_DIR:-${PREFIX:+$PREFIX/tmp}}}"
+  if [[ -z "$base_tmp" || ! -d "$base_tmp" || ! -w "$base_tmp" ]]; then
+    if [[ -d "/tmp" && -w "/tmp" ]]; then
+      base_tmp="/tmp"
+    else
+      base_tmp="$HOME/.termpeek/tmp"
+    fi
+  fi
+  local rundir="$base_tmp/termpeek-${UID:-$USER}"
+  mkdir -m 0700 -p "$rundir" 2>/dev/null || {
+    rundir="$HOME/.termpeek/tmp"
+    mkdir -m 0700 -p "$rundir" 2>/dev/null
+  }
 
   _termpeek_fifo_in="$rundir/termpeek-$$.in"
   _termpeek_fifo_out="$rundir/termpeek-$$.out"
 
   rm -f "$_termpeek_fifo_in" "$_termpeek_fifo_out" 2>/dev/null
-  mkfifo -m 0600 "$_termpeek_fifo_in" "$_termpeek_fifo_out" 2>/dev/null
+  mkfifo -m 0600 "$_termpeek_fifo_in" "$_termpeek_fifo_out" 2>/dev/null || {
+    # If FIFO creation in temp dir failed (e.g. non-POSIX mount), fallback to home directory
+    rundir="$HOME/.termpeek/tmp"
+    mkdir -m 0700 -p "$rundir" 2>/dev/null
+    _termpeek_fifo_in="$rundir/termpeek-$$.in"
+    _termpeek_fifo_out="$rundir/termpeek-$$.out"
+    rm -f "$_termpeek_fifo_in" "$_termpeek_fifo_out" 2>/dev/null
+    mkfifo -m 0600 "$_termpeek_fifo_in" "$_termpeek_fifo_out" 2>/dev/null || return 1
+  }
 
   # Open both file descriptors in Zsh first with <> (O_RDWR) to prevent any FIFO deadlock
-  exec {_termpeek_in_fd}<>"$_termpeek_fifo_in"
-  exec {_termpeek_out_fd}<>"$_termpeek_fifo_out"
+  exec {_termpeek_in_fd}<>"$_termpeek_fifo_in" || return 1
+  exec {_termpeek_out_fd}<>"$_termpeek_fifo_out" || return 1
+
+  # Locate python interpreter across all platforms (Termux, Linux, macOS, Windows)
+  local py_cmd=""
+  if (( $+commands[python3] )); then
+    py_cmd="python3"
+  elif (( $+commands[python] )); then
+    py_cmd="python"
+  elif (( $+commands[python3.12] )); then
+    py_cmd="python3.12"
+  elif (( $+commands[python3.11] )); then
+    py_cmd="python3.11"
+  fi
 
   # Spawn worker daemon in background passing FIFO paths
-  "$worker_bin" "$_termpeek_fifo_in" "$_termpeek_fifo_out" 2>/dev/null &!
+  if [[ -n "$py_cmd" ]]; then
+    "$py_cmd" "$worker_bin" "$_termpeek_fifo_in" "$_termpeek_fifo_out" 2>/dev/null &!
+  else
+    "$worker_bin" "$_termpeek_fifo_in" "$_termpeek_fifo_out" 2>/dev/null &!
+  fi
   _termpeek_worker_pid=$!
 
   # Register async callback with ZLE
@@ -576,6 +635,13 @@ if [[ -o interactive ]] || [[ -t 0 ]] || (( $+widgets )); then
   bindkey '^[OC' _termpeek_right_widget
   bindkey '^C' _termpeek_cancel_widget
   bindkey '^G' _termpeek_cancel_widget
+
+  # Universal terminfo keybindings (Linux console, Termux, rxvt, putty, xterm)
+  if zmodload zsh/terminfo 2>/dev/null; then
+    [[ -n "$terminfo[kcud1]" ]] && bindkey "$terminfo[kcud1]" _termpeek_down_widget
+    [[ -n "$terminfo[kcuu1]" ]] && bindkey "$terminfo[kcuu1]" _termpeek_up_widget
+    [[ -n "$terminfo[kcuf1]" ]] && bindkey "$terminfo[kcuf1]" _termpeek_right_widget
+  fi
 
   autoload -Uz add-zle-hook-widget
   add-zle-hook-widget line-pre-redraw _termpeek_pre_redraw

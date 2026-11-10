@@ -123,11 +123,39 @@ Add this to your `~/.zshrc`:
 zinit light zerakjamil/termpeek
 ```
 
+## Platforms supported
+
+`termpeek` runs universally on any POSIX terminal environment with Zsh and Python 3:
+
+- **macOS**: Terminal.app, iTerm2, Alacritty, Kitty, WezTerm, Ghostty (Intel & Apple Silicon).
+- **Linux**: Ubuntu, Debian, Arch Linux, Fedora, Alpine, NixOS, Void, and all standard distros across GNOME Terminal, Konsole, foot, etc.
+- **Android / Termux**: Native support on mobile phones and tablets. Adapts automatically to small portrait screens (down to 30 columns) and dynamic height adjustments when the on-screen soft keyboard opens or closes (`SIGWINCH`).
+- **Windows**: Windows Subsystem for Linux (WSL), MSYS2, Git Bash, Cygwin, and Windows Terminal.
+- **Multiplexers & SSH**: tmux, screen, and remote SSH sessions.
+
+### Installing on Termux (Android)
+
+In Termux on your phone or tablet:
+
+```bash
+# 1. Install prerequisites
+pkg update && pkg install zsh python git
+
+# 2. Clone termpeek
+git clone https://github.com/zerakjamil/termpeek.git ~/.termpeek
+
+# 3. Add to ~/.zshrc
+echo "source ~/.termpeek/termpeek.zsh" >> ~/.zshrc
+
+# 4. Launch Zsh
+exec zsh
+```
+
 ## History backends
 
-`termpeek` works out of the box with standard Zsh history (`~/.zsh_history`).
+`termpeek` works out of the box with standard Zsh history (`~/.zsh_history`) and Bash history (`~/.bash_history`). No database setup is required.
 
-If you use [Atuin](https://github.com/atuinsh/atuin), `termpeek` automatically detects its SQLite database (`~/.local/share/atuin/history.db`) for directory-scoped scoring, exit-code filtering, and sub-millisecond lookups across all terminal tabs.
+If you also use [Atuin](https://github.com/atuinsh/atuin), `termpeek` automatically detects its SQLite database (`~/.local/share/atuin/history.db`) for directory-scoped scoring, exit-code filtering, and sub-millisecond lookups across all terminal tabs.
 
 ## Verification suite
 
