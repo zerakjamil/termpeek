@@ -679,6 +679,42 @@ def run_tests():
         time.sleep(0.05)
         term.drain()
 
+        # -------------------------------------------------------------
+        # Test 10: Dynamic Prompt Expansion (%1~ Directory Change + Syntax Highlighting)
+        # -------------------------------------------------------------
+        print("\n--- Test 10: Dynamic Prompt Expansion (%1~ Directory Change) ---")
+        syntax_path = "/opt/homebrew/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
+        if os.path.exists(syntax_path):
+            term.write(f"source {syntax_path}\n".encode())
+            term._wait_for_output(0.2)
+
+        term.write(b"PROMPT='(base) %n@%m %1~ %# '\n")
+        term._wait_for_output(0.2)
+        term.write(b"cd ~\n")
+        term._wait_for_output(0.2)
+
+        # Trigger termpeek render in ~ so prompt length is cached for '~'
+        term.write(b"cd workspace")
+        term._wait_for_output(0.2)
+        term.write(b"\x15mkdir -p /tmp/termpeek_workspace_test && cd /tmp/termpeek_workspace_test\n")
+        term._wait_for_output(0.25)
+
+        # Type 'xl' then 'an' in the longer directory basename
+        term.write(b"xl")
+        term._wait_for_output(0.2)
+        term.write(b"an")
+        term._wait_for_output(0.2)
+
+        dyn_row = term.screen.row_text(term.screen.row)
+        if "termpeek_workspace_test % xlan" not in dyn_row:
+            print(f"FAIL: Dynamic prompt %1~ corrupted after cd! Row: {dyn_row!r}")
+            sys.exit(1)
+        print(f"PASS: Dynamic prompt %1~ intact after directory change: {dyn_row!r}")
+
+        term.write(b"\x15")
+        time.sleep(0.05)
+        term.drain()
+
         print("\n" + "=" * 65)
         print("ALL AUTOMATED VERIFICATION SUITES PASSED SUCCESSFULLY")
         print("=" * 65)

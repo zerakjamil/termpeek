@@ -65,16 +65,15 @@ _termpeek_clear_autosuggest() {
 }
 
 _termpeek_refresh_prompt_len() {
-  emulate -L zsh
-  setopt extendedglob
+  setopt localoptions extendedglob
   local p_raw="${PROMPT:-${PS1:-}}"
-  _termpeek_last_prompt="$p_raw"
   p_raw="${p_raw//\%\{[^%]#\%\}/}"
-  local expanded="${(%):-$p_raw}"
+  local expanded="${(%%):-$p_raw}"
+  _termpeek_last_prompt="$expanded"
   local last_line="${expanded##*$'\n'}"
   last_line="${last_line//$'\e'\[[0-9;\?:]#[a-zA-Z@]/}"
   last_line="${last_line//$'\e'\][^\a\e]#($'\a'|$'\e'\\)/}"
-  last_line="${last_line//$'\e'[78=>MDEH]/}"
+  last_line="${last_line//$'\e'[78=>MDEHcnop]/}"
   last_line="${last_line//$'\r'/}"
   _termpeek_prompt_len=${#last_line}
 }
@@ -82,8 +81,10 @@ _termpeek_refresh_prompt_len() {
 # Compute exact 1-indexed horizontal cursor column and wrapped buffer line offset
 # in pure Zsh integer arithmetic (0 forks, 0 regexes on hot keystroke path).
 _termpeek_compute_cursor() {
-  local p_cur="${PROMPT:-${PS1:-}}"
-  if [[ "$p_cur" != "$_termpeek_last_prompt" ]]; then
+  local p_raw="${PROMPT:-${PS1:-}}"
+  p_raw="${p_raw//\%\{[^%]#\%\}/}"
+  local p_exp="${(%%):-$p_raw}"
+  if [[ "$p_exp" != "$_termpeek_last_prompt" ]]; then
     _termpeek_refresh_prompt_len
   fi
   local col_limit=${COLUMNS:-80}
@@ -250,7 +251,6 @@ _termpeek_async_callback() {
 
       _termpeek_idx=0
       _termpeek_render_display
-      zle -R
       return 0
     fi
 
@@ -498,6 +498,7 @@ _termpeek_precmd() {
   _termpeek_idx=0
   _termpeek_last_buf=""
   _termpeek_last_cursor=0
+  _termpeek_last_prompt=""
   _termpeek_dismissed_buf=""
   _termpeek_lines_drawn=0
 }
