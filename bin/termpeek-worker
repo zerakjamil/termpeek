@@ -7,6 +7,7 @@ Communicates with Zsh via non-blocking pipes/FIFOs.
 import os
 import sys
 import time
+import math
 import signal
 import sqlite3
 import re
@@ -90,6 +91,10 @@ class QueryWorker:
         self.meta_cache = {}
         self.query_cache = {}
         self.history_cache = []
+        self.cmd_stats = {}
+        self.indexed_stats = []
+        self.transitions = {}
+        self.transition_totals = {}
         self.last_history_refresh = 0.0
 
         # Config flags (overridden by environment)
@@ -190,11 +195,136 @@ class QueryWorker:
 
         # Reverse so most recent commands are first
         entries.reverse()
-        return entries[:3000]
+        return entries[:8000]
+
+    def ingest_entries(self, entries):
+        """Build deduplicated frecency index and first-order Markov transition graph from history entries."""
+        self.history_cache = entries
+        self.cmd_stats = {}
+        self.transitions = {}
+        self.transition_totals = {}
+        self.query_cache.clear()
+
+        now = time.time()
+        total = len(entries)
+        prev_clean = None
+        prev_ts = 0.0
+
+        # Iterate chronologically (oldest to newest) to build accurate Markov transitions
+        for rev_idx in range(total - 1, -1, -1):
+            raw_cmd, _, cwd, raw_ts = entries[rev_idx]
+            clean = raw_cmd.replace("\r", "").replace("\n", " && ").strip()
+            if len(clean) < 2:
+                continue
+
+            if raw_ts and raw_ts > 1e12:
+                ts_sec = float(raw_ts) / 1e9
+            elif raw_ts and raw_ts > 0:
+                ts_sec = float(raw_ts)
+            else:
+                ts_sec = now - (rev_idx + 1) * 60.0
+
+            age = max(0.0, now - ts_sec)
+            decay = math.pow(0.5, age / 259200.0)
+
+            stat = self.cmd_stats.get(clean)
+            if stat is None:
+                stat = {
+                    "cmd": clean,
+                    "lower": clean.lower(),
+                    "count": 0,
+                    "frecency": 0.0,
+                    "last_ts": ts_sec,
+                    "cwd_counts": {},
+                }
+                self.cmd_stats[clean] = stat
+
+            stat["count"] += 1
+            stat["frecency"] += max(0.05, decay)
+            if ts_sec >= stat["last_ts"]:
+                stat["last_ts"] = ts_sec
+            if cwd:
+                stat["cwd_counts"][cwd] = stat["cwd_counts"].get(cwd, 0) + 1
+
+            # Record first-order Markov transition if within a 15-minute session window
+            if prev_clean and prev_clean != clean:
+                if (ts_sec - prev_ts) <= 900.0 or raw_ts == 0:
+                    t_map = self.transitions.get(prev_clean)
+                    if t_map is None:
+                        t_map = {}
+                        self.transitions[prev_clean] = t_map
+                    t_map[clean] = t_map.get(clean, 0) + 1
+                    self.transition_totals[prev_clean] = self.transition_totals.get(prev_clean, 0) + 1
+
+            prev_clean = clean
+            prev_ts = ts_sec
+
+        for st in self.cmd_stats.values():
+            age = max(0.0, now - st["last_ts"])
+            st["base_score"] = (
+                18.0 * math.log2(1.0 + st["frecency"])
+                + 6.0 * math.log2(1.0 + st["count"])
+                + 16.0 * math.pow(0.5, age / 86400.0)
+                + (st["last_ts"] * 1e-12)
+            )
+
+        self.indexed_stats = sorted(
+            self.cmd_stats.values(),
+            key=lambda s: s["base_score"],
+            reverse=True,
+        )
+
+    def record_command(self, cwd, prev_cmd, raw_cmd, ts=None):
+        """Incrementally ingest a newly executed command in <0.05ms."""
+        clean = raw_cmd.replace("\r", "").replace("\n", " && ").strip()
+        if len(clean) < 2:
+            return
+        now = float(ts) if ts is not None else time.time()
+        if now > 1e12:
+            now /= 1e9
+
+        stat = self.cmd_stats.get(clean)
+        if stat is None:
+            stat = {
+                "cmd": clean,
+                "lower": clean.lower(),
+                "count": 0,
+                "frecency": 0.0,
+                "last_ts": now,
+                "cwd_counts": {},
+                "base_score": 0.0,
+            }
+            self.cmd_stats[clean] = stat
+            self.indexed_stats.insert(0, stat)
+
+        stat["count"] += 1
+        stat["frecency"] += 1.0
+        if now >= stat["last_ts"]:
+            stat["last_ts"] = now
+        if cwd:
+            stat["cwd_counts"][cwd] = stat["cwd_counts"].get(cwd, 0) + 1
+        stat["base_score"] = (
+            18.0 * math.log2(1.0 + stat["frecency"])
+            + 6.0 * math.log2(1.0 + stat["count"])
+            + 16.0
+            + (stat["last_ts"] * 1e-12)
+        )
+
+        if prev_cmd:
+            prev_clean = prev_cmd.replace("\r", "").replace("\n", " && ").strip()
+            if prev_clean and prev_clean != clean:
+                t_map = self.transitions.get(prev_clean)
+                if t_map is None:
+                    t_map = {}
+                    self.transitions[prev_clean] = t_map
+                t_map[clean] = t_map.get(clean, 0) + 1
+                self.transition_totals[prev_clean] = self.transition_totals.get(prev_clean, 0) + 1
+
+        self.query_cache.clear()
 
     def _refresh_history_cache(self):
         now = time.time()
-        if self.history_cache and (now - self.last_history_refresh < 30.0):
+        if self.cmd_stats and (now - self.last_history_refresh < 30.0):
             return
         self.last_history_refresh = now
 
@@ -207,13 +337,14 @@ class QueryWorker:
                     FROM history
                     WHERE deleted_at IS NULL {exit_clause}
                     ORDER BY timestamp DESC
-                    LIMIT 3000;
+                    LIMIT 8000;
                 """
                 cur = self.conn.cursor()
                 cur.execute(sql)
                 rows = cur.fetchall()
                 if rows:
-                    self.history_cache = [(cmd, cmd.lower(), cwd, ts) for cmd, cwd, ts in rows]
+                    entries = [(cmd, cmd.lower(), cwd, ts) for cmd, cwd, ts in rows]
+                    self.ingest_entries(entries)
                     return
             except Exception:
                 pass
@@ -221,7 +352,7 @@ class QueryWorker:
         # Strategy 2: Universal fallback to native Zsh/Bash history file
         native_entries = self._load_native_history()
         if native_entries:
-            self.history_cache = native_entries
+            self.ingest_entries(native_entries)
 
     def get_git_root(self, cwd):
         if cwd in self.git_root_cache:
@@ -323,12 +454,60 @@ class QueryWorker:
                 masked = new_val
         return is_secret, masked
 
-    def query(self, query_id, cwd, buffer_text):
+    @staticmethod
+    def _match_quality(lower_trim, query_tokens, cmd_lower):
+        if not query_tokens:
+            return 0.0
+        first_tok = query_tokens[0]
+        if first_tok not in cmd_lower:
+            return 0.0
+
+        # Tier 1: Exact command prefix match
+        if cmd_lower.startswith(lower_trim):
+            return 115.0 + 15.0 / (1.0 + 0.08 * (len(cmd_lower) - len(lower_trim)))
+
+        # Tier 2: Contiguous substring match weighted by boundary context
+        pos = cmd_lower.find(lower_trim)
+        if pos >= 0:
+            prefix_slice = cmd_lower[:pos].rstrip()
+            if prefix_slice.endswith(("&&", ";", "|")):
+                return 94.0
+            prev_ch = cmd_lower[pos - 1]
+            if prev_ch == " ":
+                return 78.0
+            if prev_ch in ("/", "-", "_", "=", ":"):
+                return 64.0
+            return 28.0
+
+        # Tier 3: Ordered multi-token / word-boundary match (e.g. 'cd chess' -> 'cd workspace/chess')
+        if len(query_tokens) > 1:
+            search_from = 0
+            boundary_hits = 0
+            first_pos = -1
+            for idx_t, tok in enumerate(query_tokens):
+                p = cmd_lower.find(tok, search_from)
+                if p < 0:
+                    return 0.0
+                if idx_t == 0:
+                    first_pos = p
+                if p == 0 or cmd_lower[p - 1] in (" ", "/", "-", "_", "=", ":", ";", "|", "&"):
+                    boundary_hits += 1
+                search_from = p + len(tok)
+
+            score = 48.0 + 14.0 * (boundary_hits / len(query_tokens))
+            if first_pos == 0:
+                score += 18.0
+            return score
+
+        return 0.0
+
+    def query(self, query_id, cwd, buffer_text, prev_cmd=""):
         trimmed = buffer_text.strip()
         if len(trimmed) < 2:
             return f"{query_id}\t0"
 
-        cache_key = (cwd, trimmed)
+        prev_clean = prev_cmd.strip() if prev_cmd else ""
+        cache_key = (cwd, trimmed, prev_clean)
         if cache_key in self.query_cache:
             return f"{query_id}\t{self.query_cache[cache_key]}"
 
@@ -364,29 +543,56 @@ class QueryWorker:
             return True
 
         lower_trim = trimmed.lower()
+        query_tokens = lower_trim.replace("/", " ").split()
+        if not query_tokens:
+            query_tokens = [lower_trim]
 
         # Step 1: Project tasks
         for task in self.project_tasks:
-            if lower_trim in task.lower():
+            if self._match_quality(lower_trim, query_tokens, task.lower()) > 0.0:
                 add_candidate(task, "[project]")
                 if len(matches) >= self.max_results:
                     break
 
-        # Step 2: History (in-memory fast search over warm cache)
+        # Step 2: History (Token-Aware + Exponential Frecency + CWD + Markov Transitions)
         self._refresh_history_cache()
-        if len(matches) < self.max_results and self.history_cache:
-            lower_trimmed = trimmed.lower()
+        if len(matches) < self.max_results and self.indexed_stats:
+            trans_map = self.transitions.get(prev_clean) if prev_clean else None
+            trans_total = self.transition_totals.get(prev_clean, 0) if prev_clean else 0
+            first_tok = query_tokens[0]
+
             scored_rows = []
-            for row_cmd, row_cmd_lower, row_cwd, ts in self.history_cache:
-                if lower_trimmed in row_cmd_lower:
-                    score = ts
-                    if row_cwd == cwd:
-                        score += 1000000000000
-                    elif git_root and row_cwd and row_cwd.startswith(git_root):
-                        score += 500000000000
-                    scored_rows.append((score, row_cmd))
-                    if len(scored_rows) >= 30:
-                        break
+            for stat in self.indexed_stats:
+                cmd_lower = stat["lower"]
+                if first_tok not in cmd_lower:
+                    continue
+                m_score = self._match_quality(lower_trim, query_tokens, cmd_lower)
+                if m_score <= 0.0:
+                    continue
+
+                # Directory specificity boost
+                cwd_score = 0.0
+                cwd_map = stat["cwd_counts"]
+                if cwd and cwd in cwd_map:
+                    cwd_score = 65.0 + 12.0 * math.log2(1.0 + cwd_map[cwd])
+                elif git_root and cwd_map:
+                    for c_dir in cwd_map:
+                        if c_dir.startswith(git_root):
+                            cwd_score = 32.0
+                            break
+
+                # First-order Markov transition boost P(cmd_t | cmd_{t-1})
+                markov_score = 0.0
+                if trans_map and trans_total > 0:
+                    t_cnt = trans_map.get(stat["cmd"], 0)
+                    if t_cnt > 0:
+                        markov_score = (
+                            90.0 * (t_cnt / trans_total)
+                            + 18.0 * math.log2(1.0 + t_cnt)
+                        )
+
+                total_score = m_score + cwd_score + stat["base_score"] + markov_score
+                scored_rows.append((total_score, stat["cmd"]))
 
             scored_rows.sort(key=lambda x: x[0], reverse=True)
             for _, row_cmd in scored_rows:
@@ -397,7 +603,7 @@ class QueryWorker:
         # Step 3: Recipes fallback
         if self.recipes_enabled and len(matches) < self.max_results:
             for recipe in CURATED_RECIPES:
-                if lower_trim in recipe.lower():
+                if self._match_quality(lower_trim, query_tokens, recipe.lower()) > 0.0:
                     add_candidate(recipe, "[recipe]")
                     if len(matches) >= self.max_results:
                         break
@@ -446,9 +652,13 @@ def main():
                 continue
 
             fields = line.split("\t")
+            if fields[0] == "RECORD" and len(fields) >= 4:
+                worker.record_command(fields[1], fields[2], fields[3])
+                continue
             if len(fields) >= 3:
                 qid, cwd, buf = fields[0], fields[1], fields[2]
-                resp = worker.query(qid, cwd, buf)
+                prev_cmd = fields[3] if len(fields) >= 4 else ""
+                resp = worker.query(qid, cwd, buf, prev_cmd)
                 out_f.write(resp + "\n")
                 out_f.flush()
         except (BrokenPipeError, IOError):

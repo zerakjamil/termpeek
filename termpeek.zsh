@@ -26,10 +26,12 @@ typeset -ga _termpeek_displays
 typeset -gi _termpeek_idx=0
 typeset -gi _termpeek_lines_drawn=0
 typeset -gi _termpeek_qid=0
-typeset -g _termpeek_last_dir="down"
-typeset -gi _termpeek_prompt_row=1
-typeset -gi _termpeek_just_cleared=0
-typeset -gi _termpeek_last_cmd_lines=0
+typeset -gi _termpeek_target_col=1
+typeset -gi _termpeek_extra_rows=0
+typeset -gi _termpeek_prompt_len=0
+typeset -gi _termpeek_last_cursor=0
+typeset -g _termpeek_last_prompt=""
+typeset -g _termpeek_prev_cmd=""
 
 typeset -g _termpeek_last_buf=""
 typeset -g _termpeek_dismissed_buf=""
@@ -62,22 +64,62 @@ _termpeek_clear_autosuggest() {
   fi
 }
 
-# Clean display engine
+_termpeek_refresh_prompt_len() {
+  emulate -L zsh
+  setopt extendedglob
+  local p_raw="${PROMPT:-${PS1:-}}"
+  _termpeek_last_prompt="$p_raw"
+  p_raw="${p_raw//\%\{[^%]#\%\}/}"
+  local expanded="${(%):-$p_raw}"
+  local last_line="${expanded##*$'\n'}"
+  last_line="${last_line//$'\e'\[[0-9;\?:]#[a-zA-Z@]/}"
+  last_line="${last_line//$'\e'\][^\a\e]#($'\a'|$'\e'\\)/}"
+  last_line="${last_line//$'\e'[78=>MDEH]/}"
+  last_line="${last_line//$'\r'/}"
+  _termpeek_prompt_len=${#last_line}
+}
+
+# Compute exact 1-indexed horizontal cursor column and wrapped buffer line offset
+# in pure Zsh integer arithmetic (0 forks, 0 regexes on hot keystroke path).
+_termpeek_compute_cursor() {
+  local p_cur="${PROMPT:-${PS1:-}}"
+  if [[ "$p_cur" != "$_termpeek_last_prompt" ]]; then
+    _termpeek_refresh_prompt_len
+  fi
+  local col_limit=${COLUMNS:-80}
+  (( col_limit < 1 )) && col_limit=80
+
+  local buf="${BUFFER:-$_termpeek_last_buf}"
+  local cur_idx=${CURSOR:-0}
+  if (( cur_idx == 0 && ${#BUFFER} == 0 )); then
+    cur_idx=$(( _termpeek_last_cursor > 0 ? _termpeek_last_cursor : ${#buf} ))
+  fi
+
+  local cur_pos=$(( _termpeek_prompt_len + cur_idx ))
+  local end_pos=$(( _termpeek_prompt_len + ${#buf} + ${#POSTDISPLAY} ))
+
+  local cur_row_off=$(( cur_pos / col_limit ))
+  local end_row_off=$(( end_pos > 0 ? (end_pos - 1) / col_limit : 0 ))
+  (( end_row_off < cur_row_off )) && end_row_off=$cur_row_off
+
+  _termpeek_target_col=$(( (cur_pos % col_limit) + 1 ))
+  _termpeek_extra_rows=$(( end_row_off - cur_row_off ))
+}
+
+# Clean display engine using ECMA-48 relative viewport addressing
 _termpeek_clear_display() {
   if (( _termpeek_lines_drawn > 0 )); then
+    _termpeek_compute_cursor
     local seq=$'\e7'
-    local i
-    if [[ "$_termpeek_last_dir" == "up" ]]; then
-      seq+=$'\e['${_termpeek_lines_drawn}'A\r\e[2K'
-      for (( i=2; i<=_termpeek_lines_drawn; i++ )); do
-        seq+=$'\e[1E\e[2K'
-      done
-    else
-      for (( i=1; i<=_termpeek_lines_drawn; i++ )); do
-        seq+=$'\e[1E\e[2K'
-      done
+    if (( _termpeek_extra_rows > 0 )); then
+      seq+=$'\e['${_termpeek_extra_rows}'B'
     fi
-    seq+=$'\e8'
+    local i
+    for (( i=1; i<=_termpeek_lines_drawn; i++ )); do
+      seq+=$'\r\n\e[2K'
+    done
+    local up_rows=$(( _termpeek_lines_drawn + _termpeek_extra_rows ))
+    seq+=$'\e['${up_rows}$'A\e['${_termpeek_target_col}'G\e7\e8'
     print -n -u 2 -- "$seq"
     _termpeek_lines_drawn=0
   fi
@@ -102,127 +144,63 @@ _termpeek_render_display() {
   local max_drawn=$total
   (( _termpeek_lines_drawn > max_drawn )) && max_drawn=$_termpeek_lines_drawn
 
-  # Determine layout direction: render upward if near bottom boundary
-  local dir="${TERMPEEK_DIRECTION:-auto}"
-  if [[ "$dir" == "auto" ]]; then
-    local available=$(( term_lines - _termpeek_prompt_row ))
-    if (( available < max_drawn )); then
-      dir="up"
-    else
-      dir="down"
-    fi
-  fi
-
-  # If direction changed while lines were drawn, clear previous direction first
-  if (( _termpeek_lines_drawn > 0 )) && [[ "$dir" != "$_termpeek_last_dir" ]]; then
-    _termpeek_clear_display
-  fi
+  _termpeek_compute_cursor
 
   local pointer="${TERMPEEK_POINTER:-▶}"
   local col_limit=${COLUMNS:-80}
   local safe_w=$(( col_limit > 12 ? col_limit - 7 : 15 ))
   local seq=$'\e7'
-  local i
-
-  if [[ "$dir" == "up" ]]; then
-    seq+=$'\e['${max_drawn}'A'
-    for (( i=1; i<=max_drawn; i++ )); do
-      local line=""
-      if (( i <= total )); then
-        local display_cmd="${_termpeek_displays[$i]}"
-        local tag="${_termpeek_tags[$i]}"
-
-        # Prevent line wrapping on narrow terminals (Termux on phones, split panes)
-        local tag_len=${#tag}
-        local avail_cmd_w=$safe_w
-        if (( tag_len > 0 )); then
-          avail_cmd_w=$(( safe_w - tag_len - 2 ))
-        fi
-        (( avail_cmd_w < 10 )) && avail_cmd_w=10
-        if (( $#display_cmd > avail_cmd_w )); then
-          local cut_len=$(( avail_cmd_w > 3 ? avail_cmd_w - 3 : avail_cmd_w ))
-          display_cmd="${display_cmd[1,$cut_len]}..."
-        fi
-
-        local styled_tag=""
-        if [[ -n "$tag" ]]; then
-          if [[ "$tag" == *"[DANGER]"* ]]; then
-            styled_tag=$' \e[1;31m[DANGER]\e[0m'
-          elif [[ "$tag" == *"[SECRET]"* ]]; then
-            styled_tag=$' \e[33m[SECRET]\e[0m'
-          elif [[ "$tag" == *"[project]"* ]]; then
-            styled_tag=$' \e[36m[project]\e[0m'
-          elif [[ "$tag" == *"[recipe]"* ]]; then
-            styled_tag=$' \e[35m[recipe]\e[0m'
-          else
-            styled_tag="  $tag"
-          fi
-        fi
-
-        if (( i == _termpeek_idx )); then
-          line=$'\e[1;34m'"$pointer"$'\e[0m \e[1m'"$i"$'\e[0m  \e[1m'"$display_cmd"$'\e[0m'"$styled_tag"
-        else
-          line="  "$'\e[2m'"$i"$'\e[0m  '"$display_cmd$styled_tag"
-        fi
-      fi
-
-      if (( i == 1 )); then
-        seq+=$'\r\e[2K'"$line"
-      else
-        seq+=$'\e[1E\e[2K'"$line"
-      fi
-    done
-    seq+=$'\e8'
-    print -n -u 2 -- "$seq"
-    _termpeek_lines_drawn=$total
-    _termpeek_last_dir="up"
-  else
-    for (( i=1; i<=max_drawn; i++ )); do
-      local line=""
-      if (( i <= total )); then
-        local display_cmd="${_termpeek_displays[$i]}"
-        local tag="${_termpeek_tags[$i]}"
-
-        # Prevent line wrapping on narrow terminals (Termux on phones, split panes)
-        local tag_len=${#tag}
-        local avail_cmd_w=$safe_w
-        if (( tag_len > 0 )); then
-          avail_cmd_w=$(( safe_w - tag_len - 2 ))
-        fi
-        (( avail_cmd_w < 10 )) && avail_cmd_w=10
-        if (( $#display_cmd > avail_cmd_w )); then
-          local cut_len=$(( avail_cmd_w > 3 ? avail_cmd_w - 3 : avail_cmd_w ))
-          display_cmd="${display_cmd[1,$cut_len]}..."
-        fi
-
-        local styled_tag=""
-        if [[ -n "$tag" ]]; then
-          if [[ "$tag" == *"[DANGER]"* ]]; then
-            styled_tag=$' \e[1;31m[DANGER]\e[0m'
-          elif [[ "$tag" == *"[SECRET]"* ]]; then
-            styled_tag=$' \e[33m[SECRET]\e[0m'
-          elif [[ "$tag" == *"[project]"* ]]; then
-            styled_tag=$' \e[36m[project]\e[0m'
-          elif [[ "$tag" == *"[recipe]"* ]]; then
-            styled_tag=$' \e[35m[recipe]\e[0m'
-          else
-            styled_tag="  $tag"
-          fi
-        fi
-
-        if (( i == _termpeek_idx )); then
-          line=$'\e[1;34m'"$pointer"$'\e[0m \e[1m'"$i"$'\e[0m  \e[1m'"$display_cmd"$'\e[0m'"$styled_tag"
-        else
-          line="  "$'\e[2m'"$i"$'\e[0m  '"$display_cmd$styled_tag"
-        fi
-      fi
-      seq+=$'\e[1E\e[2K'"$line"
-    done
-    seq+=$'\e8'
-    print -n -u 2 -- "$seq"
-    _termpeek_lines_drawn=$total
-    _termpeek_last_dir="down"
+  if (( _termpeek_extra_rows > 0 )); then
+    seq+=$'\e['${_termpeek_extra_rows}'B'
   fi
+
+  local i
+  for (( i=1; i<=max_drawn; i++ )); do
+    local line=""
+    if (( i <= total )); then
+      local display_cmd="${_termpeek_displays[$i]}"
+      local tag="${_termpeek_tags[$i]}"
+
+      # Prevent line wrapping on narrow terminals (Termux on phones, split panes)
+      local tag_len=${#tag}
+      local avail_cmd_w=$safe_w
+      if (( tag_len > 0 )); then
+        avail_cmd_w=$(( safe_w - tag_len - 2 ))
+      fi
+      (( avail_cmd_w < 10 )) && avail_cmd_w=10
+      if (( $#display_cmd > avail_cmd_w )); then
+        local cut_len=$(( avail_cmd_w > 3 ? avail_cmd_w - 3 : avail_cmd_w ))
+        display_cmd="${display_cmd[1,$cut_len]}..."
+      fi
+
+      local styled_tag=""
+      if [[ -n "$tag" ]]; then
+        if [[ "$tag" == *"[DANGER]"* ]]; then
+          styled_tag=$' \e[1;31m[DANGER]\e[0m'
+        elif [[ "$tag" == *"[SECRET]"* ]]; then
+          styled_tag=$' \e[33m[SECRET]\e[0m'
+        elif [[ "$tag" == *"[project]"* ]]; then
+          styled_tag=$' \e[36m[project]\e[0m'
+        elif [[ "$tag" == *"[recipe]"* ]]; then
+          styled_tag=$' \e[35m[recipe]\e[0m'
+        else
+          styled_tag="  $tag"
+        fi
+      fi
+
+      if (( i == _termpeek_idx )); then
+        line=$'\e[1;34m'"$pointer"$'\e[0m \e[1m'"$i"$'\e[0m  \e[1m'"$display_cmd"$'\e[0m'"$styled_tag"
+      else
+        line="  "$'\e[2m'"$i"$'\e[0m  '"$display_cmd$styled_tag"
+      fi
+    fi
+    seq+=$'\r\n\e[2K'"$line"
+  done
+
+  local up_rows=$(( max_drawn + _termpeek_extra_rows ))
+  seq+=$'\e['${up_rows}$'A\e['${_termpeek_target_col}'G\e7\e8'
+  print -n -u 2 -- "$seq"
+  _termpeek_lines_drawn=$total
 }
 
 # Asynchronous worker response handler (triggered by zle -F)
@@ -288,6 +266,7 @@ _termpeek_async_callback() {
 # Keystroke hook: 0 forks, 0 subshells, non-blocking query write
 _termpeek_pre_redraw() {
   local current="$BUFFER"
+  _termpeek_last_cursor=${CURSOR:-${#current}}
 
   # No-op if buffer hasn't changed
   if [[ "$current" == "$_termpeek_last_buf" ]]; then
@@ -314,7 +293,7 @@ _termpeek_pre_redraw() {
 
   # Dispatch query to background worker via non-blocking FIFO write (0 forks)
   if (( _termpeek_in_fd > 0 )); then
-    print -u $_termpeek_in_fd -r -- "$_termpeek_qid"$'\t'"$PWD"$'\t'"$current" 2>/dev/null
+    print -u $_termpeek_in_fd -r -- "$_termpeek_qid"$'\t'"$PWD"$'\t'"$current"$'\t'"$_termpeek_prev_cmd" 2>/dev/null
   fi
 }
 
@@ -327,8 +306,8 @@ _termpeek_down() {
       _termpeek_idx=1
     fi
     _termpeek_clear_autosuggest
-    _termpeek_render_display
     [[ -o zle ]] && zle -R
+    _termpeek_render_display
     return 0
   fi
   [[ -o zle ]] && zle .down-line-or-history
@@ -339,16 +318,16 @@ _termpeek_up() {
   if (( ${#_termpeek_matches[@]} > 0 && _termpeek_idx > 1 )); then
     (( _termpeek_idx-- ))
     _termpeek_clear_autosuggest
-    _termpeek_render_display
     [[ -o zle ]] && zle -R
+    _termpeek_render_display
     return 0
   elif (( ${#_termpeek_matches[@]} > 0 && _termpeek_idx == 1 )); then
     _termpeek_idx=0
-    _termpeek_render_display
     if (( $+widgets[autosuggest-fetch] )); then
       [[ -o zle ]] && zle autosuggest-fetch
     fi
     [[ -o zle ]] && zle -R
+    _termpeek_render_display
     return 0
   fi
   [[ -o zle ]] && zle .up-line-or-history
@@ -425,15 +404,17 @@ _termpeek_enter() {
     POSTDISPLAY=""
 
     if (( is_danger == 1 )); then
+      [[ -o zle ]] && zle -R
+      _termpeek_compute_cursor
       local dseq=$'\e7'
-      if [[ "$_termpeek_last_dir" == "up" ]]; then
-        dseq+=$'\e[1A\r\e[2K⚠️  [DANGER GUARD] Destructive command loaded to prompt for review. Press Enter to run.\e8'
-      else
-        dseq+=$'\e[1E\e[2K⚠️  [DANGER GUARD] Destructive command loaded to prompt for review. Press Enter to run.\e8'
+      if (( _termpeek_extra_rows > 0 )); then
+        dseq+=$'\e['${_termpeek_extra_rows}'B'
       fi
+      dseq+=$'\r\n\e[2K⚠️  [DANGER GUARD] Destructive command loaded to prompt for review. Press Enter to run.'
+      local up_rows=$(( 1 + _termpeek_extra_rows ))
+      dseq+=$'\e['${up_rows}$'A\e['${_termpeek_target_col}'G\e7\e8'
       print -n -u 2 -- "$dseq"
       _termpeek_lines_drawn=1
-      [[ -o zle ]] && zle -R
       return 0
     fi
   else
@@ -484,28 +465,6 @@ _termpeek_cancel() {
   [[ -o zle ]] && zle .send-break
 }
 
-typeset -gi _termpeek_cmd_count=0
-
-_termpeek_update_cursor_row() {
-  local term_lines=${LINES:-24}
-  if (( _termpeek_just_cleared == 1 || _termpeek_cmd_count == 0 )); then
-    _termpeek_prompt_row=1
-    return
-  fi
-
-  # If multi-line commands or enough commands have run, the screen has scrolled to bottom
-  if (( _termpeek_cmd_count >= 3 )); then
-    _termpeek_prompt_row=$term_lines
-  else
-    local estimated=$(( _termpeek_cmd_count * 3 + 1 ))
-    if (( estimated >= term_lines )); then
-      _termpeek_prompt_row=$term_lines
-    else
-      _termpeek_prompt_row=$estimated
-    fi
-  fi
-}
-
 # Lifecycle hooks
 _termpeek_preexec() {
   _termpeek_clear_display
@@ -517,20 +476,15 @@ _termpeek_preexec() {
   _termpeek_idx=0
   _termpeek_lines_drawn=0
   local cmd="$1"
-  if [[ "$cmd" == "clear"* || "$cmd" == "reset"* || "$cmd" == "tput reset"* ]]; then
-    _termpeek_just_cleared=1
-    _termpeek_cmd_count=0
-  else
-    _termpeek_just_cleared=0
-    # Multi-line commands immediately scroll terminal to bottom row
-    if [[ "$cmd" == *"for "* || "$cmd" == *"while "* || "$cmd" == *"{1.."* || \
-          "$cmd" == *"xlan"* || "$cmd" == *"expo "* || "$cmd" == *"metro"* || \
-          "$cmd" == *"npm "* || "$cmd" == *"yarn "* || "$cmd" == *"pnpm "* || \
-          "$cmd" == *"docker "* || "$cmd" == *"git log"* || "$cmd" == *"git diff"* ]]; then
-      _termpeek_cmd_count=100
-    else
-      (( _termpeek_cmd_count++ ))
+  local clean_cmd="${cmd//$'\r'/}"
+  clean_cmd="${clean_cmd//$'\n'/ && }"
+  clean_cmd="${clean_cmd## #}"
+  clean_cmd="${clean_cmd%% #}"
+  if [[ -n "$clean_cmd" ]]; then
+    if (( _termpeek_in_fd > 0 )); then
+      print -u $_termpeek_in_fd -r -- "RECORD"$'\t'"$PWD"$'\t'"$_termpeek_prev_cmd"$'\t'"$clean_cmd" 2>/dev/null
     fi
+    _termpeek_prev_cmd="$clean_cmd"
   fi
 }
 
@@ -543,15 +497,12 @@ _termpeek_precmd() {
   _termpeek_displays=()
   _termpeek_idx=0
   _termpeek_last_buf=""
+  _termpeek_last_cursor=0
   _termpeek_dismissed_buf=""
   _termpeek_lines_drawn=0
-  _termpeek_update_cursor_row
 }
 
 _termpeek_clear_screen() {
-  _termpeek_just_cleared=1
-  _termpeek_cmd_count=0
-  _termpeek_prompt_row=1
   _termpeek_clear_display
   zle .clear-screen
 }
@@ -559,7 +510,6 @@ _termpeek_clear_screen() {
 # Handle terminal resize
 TRAPWINCH() {
   _termpeek_clear_display
-  _termpeek_update_cursor_row
   if (( ${#_termpeek_matches[@]} > 0 )); then
     _termpeek_render_display
   fi
@@ -669,6 +619,7 @@ if [[ -o interactive ]] || [[ -t 0 ]] || (( $+widgets )); then
   bindkey '^J' _termpeek_enter_widget
   bindkey '\e' _termpeek_escape_widget
   bindkey '^[' _termpeek_escape_widget
+  (( KEYTIMEOUT == 40 )) && KEYTIMEOUT=5
   bindkey '^[[C' _termpeek_right_widget
   bindkey '^[OC' _termpeek_right_widget
   bindkey '^C' _termpeek_cancel_widget

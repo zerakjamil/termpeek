@@ -23,10 +23,160 @@ import shutil
 import select
 
 
+class VT100Screen:
+    """Deterministic 2D VT100/ECMA-48 framebuffer state machine oracle."""
+
+    def __init__(self, rows=24, cols=80):
+        self.rows = rows
+        self.cols = cols
+        self.grid = [[" " for _ in range(cols)] for _ in range(rows)]
+        self.row = 0
+        self.col = 0
+        self.saved_row = 0
+        self.saved_col = 0
+
+    def resize(self, rows, cols):
+        new_grid = [[" " for _ in range(cols)] for _ in range(rows)]
+        for r in range(min(self.rows, rows)):
+            for c in range(min(self.cols, cols)):
+                new_grid[r][c] = self.grid[r][c]
+        self.rows = rows
+        self.cols = cols
+        self.grid = new_grid
+        self.row = min(self.row, rows - 1)
+        self.col = min(self.col, cols - 1)
+
+    def row_text(self, r):
+        if 0 <= r < self.rows:
+            return "".join(self.grid[r]).rstrip()
+        return ""
+
+    def feed(self, data: bytes):
+        text = data.decode("utf-8", errors="replace")
+        i = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "\x1b":
+                i += 1
+                if i >= n:
+                    break
+                nxt = text[i]
+                if nxt == "[":
+                    i += 1
+                    params = ""
+                    while i < n and text[i] in "0123456789;?:":
+                        params += text[i]
+                        i += 1
+                    if i < n:
+                        cmd = text[i]
+                        i += 1
+                        self._handle_csi(params, cmd)
+                elif nxt == "]":
+                    i += 1
+                    while i < n:
+                        if text[i] == "\x07":
+                            i += 1
+                            break
+                        if text[i] == "\x1b" and i + 1 < n and text[i + 1] == "\\":
+                            i += 2
+                            break
+                        i += 1
+                elif nxt == "7":
+                    self.saved_row = self.row
+                    self.saved_col = self.col
+                    i += 1
+                elif nxt == "8":
+                    self.row = max(0, min(self.rows - 1, self.saved_row))
+                    self.col = max(0, min(self.cols - 1, self.saved_col))
+                    i += 1
+                else:
+                    i += 1
+            elif ch == "\r":
+                self.col = 0
+                i += 1
+            elif ch == "\n":
+                if self.row >= self.rows - 1:
+                    self.grid.pop(0)
+                    self.grid.append([" " for _ in range(self.cols)])
+                    self.row = self.rows - 1
+                else:
+                    self.row += 1
+                i += 1
+            elif ch == "\b":
+                self.col = max(0, self.col - 1)
+                i += 1
+            elif ch == "\x07":
+                i += 1
+            elif ord(ch) >= 32:
+                if self.col >= self.cols:
+                    self.col = 0
+                    if self.row >= self.rows - 1:
+                        self.grid.pop(0)
+                        self.grid.append([" " for _ in range(self.cols)])
+                    else:
+                        self.row += 1
+                self.grid[self.row][self.col] = ch
+                self.col += 1
+                i += 1
+            else:
+                i += 1
+
+    def _handle_csi(self, params: str, cmd: str):
+        clean_p = params.lstrip("?")
+        parts = [int(p) if p.isdigit() else 0 for p in clean_p.split(";")] if clean_p else [0]
+        arg1 = parts[0] if parts else 0
+
+        if cmd == "A":
+            step = max(1, arg1)
+            self.row = max(0, self.row - step)
+        elif cmd == "B":
+            step = max(1, arg1)
+            self.row = min(self.rows - 1, self.row + step)
+        elif cmd == "C":
+            step = max(1, arg1)
+            self.col = min(self.cols - 1, self.col + step)
+        elif cmd == "D":
+            step = max(1, arg1)
+            self.col = max(0, self.col - step)
+        elif cmd == "E":
+            step = max(1, arg1)
+            self.row = min(self.rows - 1, self.row + step)
+            self.col = 0
+        elif cmd == "G":
+            target = max(1, arg1) - 1
+            self.col = min(self.cols - 1, target)
+        elif cmd in ("H", "f"):
+            r = (parts[0] - 1) if len(parts) >= 1 and parts[0] > 0 else 0
+            c = (parts[1] - 1) if len(parts) >= 2 and parts[1] > 0 else 0
+            self.row = max(0, min(self.rows - 1, r))
+            self.col = max(0, min(self.cols - 1, c))
+        elif cmd == "K":
+            if arg1 == 0:
+                for c in range(self.col, self.cols):
+                    self.grid[self.row][c] = " "
+            elif arg1 == 1:
+                for c in range(0, min(self.cols, self.col + 1)):
+                    self.grid[self.row][c] = " "
+            elif arg1 == 2:
+                self.grid[self.row] = [" " for _ in range(self.cols)]
+        elif cmd == "J":
+            if arg1 == 0:
+                for c in range(self.col, self.cols):
+                    self.grid[self.row][c] = " "
+                for r in range(self.row + 1, self.rows):
+                    self.grid[r] = [" " for _ in range(self.cols)]
+            elif arg1 == 2:
+                self.grid = [[" " for _ in range(self.cols)] for _ in range(self.rows)]
+                self.row = 0
+                self.col = 0
+
+
 class HeadlessPTY:
     def __init__(self, termpeek_path, rows=24, cols=80):
         self.rows = rows
         self.cols = cols
+        self.screen = VT100Screen(rows, cols)
         self.zdotdir = tempfile.mkdtemp(prefix="termpeek_test_")
 
         # Create clean .zshrc
@@ -64,6 +214,8 @@ class HeadlessPTY:
     def set_winsize(self, rows, cols):
         self.rows = rows
         self.cols = cols
+        if hasattr(self, "screen"):
+            self.screen.resize(rows, cols)
         winsize = struct.pack("HHHH", rows, cols, 0, 0)
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, winsize)
 
@@ -79,6 +231,7 @@ class HeadlessPTY:
                 try:
                     chunk = os.read(self.master, 4096)
                     if chunk:
+                        self.screen.feed(chunk)
                         chunks.append(chunk)
                 except (BlockingIOError, OSError):
                     break
@@ -89,8 +242,10 @@ class HeadlessPTY:
     def drain(self):
         while True:
             try:
-                if not os.read(self.master, 4096):
+                chunk = os.read(self.master, 4096)
+                if not chunk:
                     break
+                self.screen.feed(chunk)
             except Exception:
                 break
 
@@ -103,6 +258,7 @@ class HeadlessPTY:
                 try:
                     chunk = os.read(self.master, 4096)
                     if chunk:
+                        self.screen.feed(chunk)
                         buf.append(chunk)
                 except Exception:
                     break
@@ -232,6 +388,9 @@ def run_tests():
                     except Exception:
                         break
 
+            if received:
+                term.screen.feed(received)
+
             time.sleep(0.02)
             term.drain()
 
@@ -274,14 +433,15 @@ def run_tests():
 
         # Press Escape (\x1b)
         term.write(b"\x1b")
-        time.sleep(0.05)
+        time.sleep(0.08)
         esc_output = term.read_available(0.05)
 
         # Clear line sequence contains \x1b7, \x1b[2K, \x1b8
         if b"\x1b7" in esc_output and b"\x1b[2K" in esc_output and b"\x1b8" in esc_output:
             print("PASS: [Escape] Cleared suggestion lines and restored cursor cleanly")
         else:
-            print("PASS: [Escape] Cleanly dismissed suggestions without artifacts")
+            print(f"FAIL: [Escape] Expected clear escape sequences, got {esc_output!r}")
+            sys.exit(1)
 
         # 3b. Ctrl+C (SIGINT) cancellation
         term.write(b"\x15")
@@ -384,7 +544,7 @@ def run_tests():
 
             # Record a command in history
             term.write(b"php artisan serve --port=8091\n")
-            time.sleep(0.1)
+            time.sleep(0.35)
             term.drain()
 
             # Type prefix
@@ -402,8 +562,8 @@ def run_tests():
 
             # Execute and check prompt output
             term.write(b"\n")
-            time.sleep(0.15)
-            exec_output = term.read_available(0.15).decode("utf-8", errors="replace")
+            time.sleep(0.35)
+            exec_output = term.read_available(0.2).decode("utf-8", errors="replace")
 
             # Verify no mashed/stale ghost text in executed output
             if "8091artisan" in tab_output or "8091artisan" in exec_output:
@@ -440,34 +600,84 @@ def run_tests():
         print("PASS: SIGINT on running command restored prompt cleanly without ZLE errors")
 
         # -------------------------------------------------------------
-        # Test 8: Bottom-Row Prompt Preservation (Zero Overwrite at Line LINES)
+        # Test 8: 2D VT100 Framebuffer Oracle at Bottom Margin (row == LINES)
         # -------------------------------------------------------------
-        print("\n--- Test 8: Bottom-Row Prompt Preservation ---")
-        # Run a multi-line output command to push prompt to bottom row
+        print("\n--- Test 8: 2D VT100 Framebuffer Oracle at Bottom Margin ---")
+        # Reset to a clean 1-line prompt and push cursor to bottom row (row 23 of 24)
+        term.write(b"PROMPT='termpeek%% '\n")
+        term._wait_for_output(0.25)
         term.write(b"for i in {1..30}; do echo row $i; done\n")
-        time.sleep(0.15)
-        term.drain()
+        term._wait_for_output(0.35)
+
+        if term.screen.row != term.rows - 1:
+            print(f"FAIL: Expected cursor at bottom row {term.rows - 1}, got {term.screen.row}")
+            sys.exit(1)
 
         # Type 'git' at bottom row
         term.write(b"git")
-        time.sleep(0.15)
-        row_output = term.read_available(0.15)
+        term._wait_for_output(0.25)
 
-        # At the bottom row, upward boundary rendering must be used (\x1b[...A)
-        # and cursor restored with \x1b8 so prompt row is never overwritten
-        if b"\x1b[" in row_output and b"A" in row_output and b"\x1b8" in row_output:
-            print("PASS: Upward boundary rendering triggered at terminal bottom margin")
-        else:
-            print("PASS: Prompt row preserved without clipping or erasure")
+        prompt_r = term.screen.row
+        prompt_line_text = term.screen.row_text(prompt_r)
+        if "termpeek% git" not in prompt_line_text:
+            print(f"FAIL: Prompt row overwritten at bottom margin! Row {prompt_r}: {prompt_line_text!r}")
+            sys.exit(1)
 
-        # Clear line with Enter
+        if term.screen.col != len("termpeek% git"):
+            print(f"FAIL: Cursor col mismatch: expected {len('termpeek% git')}, got {term.screen.col}")
+            sys.exit(1)
+
+        # Verify distinct suggestion rows below the scrolled prompt row
+        below_rows = [term.screen.row_text(r) for r in range(prompt_r + 1, term.rows)]
+        non_empty_below = [line for line in below_rows if line.strip()]
+        if len(non_empty_below) < 2 or not non_empty_below[0].strip().startswith("1"):
+            print(f"FAIL: Suggestions did not occupy distinct rows below prompt: {below_rows!r}")
+            sys.exit(1)
+        print(f"PASS: VT100 Grid verified prompt intact at row {prompt_r} with {len(non_empty_below)} distinct suggestion rows below")
+
+        # Dismiss with Escape and verify all rows below prompt_r are blank in the 2D grid
+        term.write(b"\x1b")
+        term._wait_for_output(0.15)
+
+        orphaned = [term.screen.row_text(r) for r in range(prompt_r + 1, term.rows) if term.screen.row_text(r).strip()]
+        if orphaned:
+            print(f"FAIL: Orphaned lines remained in VT100 framebuffer after Escape: {orphaned!r}")
+            sys.exit(1)
+        print("PASS: VT100 Grid verified 0 orphaned cells below prompt after Escape dismissal")
+
+        # Execute a command to confirm prompt remains operational
         term.write(b"\x15echo prompt_intact\n")
-        time.sleep(0.15)
-        intact_out = term.read_available(0.15).decode("utf-8", errors="replace")
+        intact_out = term._wait_for_output(0.25).decode("utf-8", errors="replace")
         if "prompt_intact" not in intact_out:
             print("FAIL: Prompt line was damaged at bottom row")
             sys.exit(1)
         print("PASS: Prompt remains fully functional and intact at bottom row")
+
+        # -------------------------------------------------------------
+        # Test 9: Live IPC Command Ingestion & Markov Transition Boost
+        # -------------------------------------------------------------
+        print("\n--- Test 9: Live IPC Command Ingestion & Markov Transition Boost ---")
+        term.write(b"echo step_alpha_marker\n")
+        term._wait_for_output(0.2)
+        term.write(b"echo step_beta_target_unique\n")
+        term._wait_for_output(0.2)
+
+        # Run step_alpha_marker again so prev_cmd becomes 'echo step_alpha_marker'
+        term.write(b"echo step_alpha_marker\n")
+        term._wait_for_output(0.2)
+
+        # Now type 'echo step_' and verify 'echo step_beta_target_unique' is ranked #1 via Markov transition
+        term.write(b"echo step_")
+        term._wait_for_output(0.2)
+        first_sug_row = term.screen.row_text(term.screen.row + 1)
+        if "echo step_beta_target_unique" not in first_sug_row:
+            print(f"FAIL: Live Markov transition did not rank target #1. Row+1: {first_sug_row!r}")
+            sys.exit(1)
+        print("PASS: Live RECORD ingestion and Markov transition ranked sequential target #1 immediately")
+
+        term.write(b"\x15")
+        time.sleep(0.05)
+        term.drain()
 
         print("\n" + "=" * 65)
         print("ALL AUTOMATED VERIFICATION SUITES PASSED SUCCESSFULLY")
