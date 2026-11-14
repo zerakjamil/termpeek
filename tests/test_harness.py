@@ -715,6 +715,38 @@ def run_tests():
         time.sleep(0.05)
         term.drain()
 
+        # -------------------------------------------------------------
+        # Test 11: Long Pasted Path, Multi-Line Wrapping, and Native Ctrl+C
+        # -------------------------------------------------------------
+        print("\n--- Test 11: Long Pasted Path, Multi-Line Wrap, and Native Ctrl+C ---")
+        term.write(b"open ")
+        term._wait_for_output(0.25)
+
+        # Paste 130-char path that wraps prompt onto row 3
+        long_path = b"/Users/zerakjamil/.gemini/antigravity/brain/74933832-423c-4a29-a2d7-921fe6fffe9b/Crucial_Conversations_Academic_Blueprint.pdf"
+        term.write(long_path)
+        term._wait_for_output(0.25)
+
+        # Backspace 4 times (.pdf)
+        term.write(b"\x7f\x7f\x7f\x7f")
+        term._wait_for_output(0.25)
+
+        # Confirm no leftover text like 'opencode' or '--continue' in wrapped lines
+        wrapped_text = "\n".join([term.screen.row_text(r) for r in range(term.rows)])
+        if "opencode" in wrapped_text or "--continue" in wrapped_text:
+            print("FAIL: Ghost text from previous suggestions remained after multi-line paste/edit")
+            sys.exit(1)
+        print("PASS: Multi-line wrap and backspace executed cleanly with zero ghost text")
+
+        # Native Ctrl+C must abort the line and produce a fresh prompt
+        term.write(b"\x03")
+        term._wait_for_output(0.2)
+        bottom_prompt = term.screen.row_text(term.screen.row)
+        if "termpeek_workspace_test %" not in bottom_prompt and "%" not in bottom_prompt:
+            print(f"FAIL: Ctrl+C did not restore fresh prompt: {bottom_prompt!r}")
+            sys.exit(1)
+        print("PASS: Native Ctrl+C cleanly aborted wrapped line and restored fresh prompt")
+
         print("\n" + "=" * 65)
         print("ALL AUTOMATED VERIFICATION SUITES PASSED SUCCESSFULLY")
         print("=" * 65)

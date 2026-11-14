@@ -81,10 +81,7 @@ _termpeek_refresh_prompt_len() {
 # Compute exact 1-indexed horizontal cursor column and wrapped buffer line offset
 # in pure Zsh integer arithmetic (0 forks, 0 regexes on hot keystroke path).
 _termpeek_compute_cursor() {
-  local p_raw="${PROMPT:-${PS1:-}}"
-  p_raw="${p_raw//\%\{[^%]#\%\}/}"
-  local p_exp="${(%%):-$p_raw}"
-  if [[ "$p_exp" != "$_termpeek_last_prompt" ]]; then
+  if (( _termpeek_prompt_len <= 0 )); then
     _termpeek_refresh_prompt_len
   fi
   local col_limit=${COLUMNS:-80}
@@ -132,7 +129,12 @@ _termpeek_render_display() {
   local trimmed="${buf## #}"
   trimmed="${trimmed%% #}"
 
-  if [[ ${#trimmed} -lt 2 || "$buf" == "$_termpeek_dismissed_buf" || total == 0 ]]; then
+  local col_limit=${COLUMNS:-80}
+  (( col_limit < 1 )) && col_limit=80
+
+  # Suppress preview if buffer is too short, dismissed, or wraps across multiple lines.
+  # Emitting raw VT100 newlines below soft-wrapped lines breaks terminal xenl invariants.
+  if [[ ${#trimmed} -lt 2 || "$buf" == "$_termpeek_dismissed_buf" || total == 0 ]] || (( _termpeek_prompt_len + ${#buf} >= col_limit )); then
     _termpeek_clear_display
     return 0
   fi
@@ -280,8 +282,11 @@ _termpeek_pre_redraw() {
   local trimmed="${current## #}"
   trimmed="${trimmed%% #}"
 
-  # Clear display if buffer is empty or 1 character
-  if [[ ${#trimmed} -lt 2 || "$current" == "$_termpeek_dismissed_buf" ]]; then
+  local col_limit=${COLUMNS:-80}
+  (( col_limit < 1 )) && col_limit=80
+
+  # Clear display if buffer is empty, single character, dismissed, or wraps across lines
+  if [[ ${#trimmed} -lt 2 || "$current" == "$_termpeek_dismissed_buf" ]] || (( _termpeek_prompt_len + ${#current} >= col_limit )); then
     _termpeek_clear_display
     _termpeek_matches=()
     _termpeek_tags=()
@@ -377,6 +382,7 @@ _termpeek_right() {
 
   # Pass through to inline autosuggestion accept if available, else standard forward-char
   if (( $+widgets[autosuggest-accept] )); then
+    _termpeek_clear_display
     [[ -o zle ]] && zle autosuggest-accept
     return 0
   fi
@@ -501,6 +507,7 @@ _termpeek_precmd() {
   _termpeek_last_prompt=""
   _termpeek_dismissed_buf=""
   _termpeek_lines_drawn=0
+  _termpeek_refresh_prompt_len
 }
 
 _termpeek_clear_screen() {
@@ -623,7 +630,7 @@ if [[ -o interactive ]] || [[ -t 0 ]] || (( $+widgets )); then
   (( KEYTIMEOUT == 40 )) && KEYTIMEOUT=5
   bindkey '^[[C' _termpeek_right_widget
   bindkey '^[OC' _termpeek_right_widget
-  bindkey '^C' _termpeek_cancel_widget
+  # Note: Never bind '^C' so native shell SIGINT is preserved for clean prompt abortion
   bindkey '^G' _termpeek_cancel_widget
   bindkey '^L' _termpeek_clear_screen_widget
 
