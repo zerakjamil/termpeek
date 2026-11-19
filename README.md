@@ -2,55 +2,74 @@
   <img src="assets/logo.png" alt="termpeek" width="520">
 </p>
 
-# termpeek
+# termpeek 2.0
 
-Live type-ahead command history search for Zsh.
+Intelligent dual-layer type-ahead command assistance and live pre-flight inspection for Zsh.
 
-When you type a keyword in your terminal, matching commands from your history appear directly below your prompt. You can navigate through them, fill the prompt with Tab or Right Arrow, run immediately with Enter, or dismiss with Escape.
+When typing commands in your terminal, Termpeek provides instantaneous native inline completions without screen flicker or terminal row corruption. Pressing `Tab` or `Ctrl+Space` summons the **Live Pre-Flight Inspector**: a transient HUD that audits port collisions, git synchronization status, and destructive blast radius before you press Enter.
 
-## Architecture
+## Dual-Layer Architecture
 
-Traditional shell plugins fork subshells or run database commands synchronously on every keypress. When typing at 80 to 100 WPM, this causes dropped characters and input latency.
+Traditional shell plugins either manipulate out-of-band VT100 cursor escapes (which fight ZLE internal 2D line wrapping buffers and corrupt prompts) or take over the entire terminal with intrusive full-screen TUIs.
 
-`termpeek` uses an asynchronous two-layer architecture:
+`termpeek 2.0` solves this with a clean dual-layer architecture:
 
-1. **Zero-Fork Interactive Client**: The ZLE line hook uses only shell builtins. It writes queries to a private non-blocking FIFO and returns control to Zsh immediately in under 0.05ms. Typing latency remains at raw hardware speed.
-2. **Persistent Background Query Worker**: A warm background daemon processes history scoring and file parsing off the main thread.
-3. **Async Callback via `zle -F`**: Results stream back over a dedicated response descriptor. Zsh wakes up via native file descriptor polling and renders the preview without interrupting active typing.
-4. **Native Terminal Display Engine**: Instead of appending raw multi-line strings to `POSTDISPLAY` (which breaks multi-line prompts and collides with `zsh-autosuggestions`), `termpeek` renders directly using cursor-restoring ANSI escape sequences with strict terminal boundary clamping. Clean cancellation leaves zero orphaned lines on Escape, Ctrl+C, or window resize (SIGWINCH).
+1. **Layer 1: Native ZLE Inline Ghost Completion (Keystroke Path)**:
+   - Emits **zero** ANSI cursor movement escapes (`\e7`, `\e8`, `\e[B`, `\e[A`) to `stderr`.
+   - Populates native ZLE `POSTDISPLAY` with syntax-highlighted ghost text (`fg=8,underline`).
+   - Line wrapping across `$COLUMNS`, multi-line paths, and backspacing are 100% handled by the terminal's native screen buffer.
+   - Keystroke latency is sub-1ms with 0 subprocess forks.
 
-## Developer features
+2. **Layer 2: Sandboxed Alternate-Screen Pre-Flight HUD (Inspection Path)**:
+   - Summons on demand via `Ctrl+Space`, `Alt+P`, or `Down Arrow`.
+   - Runs exclusively on the terminal alternate screen buffer (`\e[?1049h\e[?25l`), freezing the main terminal canvas and scrollback.
+   - Renders an interactive inspection card showing prompt reflection, numbered Markov completions, and live environment diagnostics.
+   - Exits cleanly with `\e[?1049l\e[?25h` and `zle reset-prompt`. Failsafe traps and `always` blocks guarantee zero terminal lockups and healthy TTY state under any interruption.
 
-`termpeek` includes features built specifically for daily engineering workflows:
+3. **Persistent Asynchronous Background Worker**:
+   - A warm Python daemon processes history scoring, dual-stack socket availability, and filesystem metrics off the main thread over non-blocking Unix FIFOs.
 
-- **Project Task Discovery (`[project]`)**: Whenever you enter a directory, `termpeek` inspects `package.json`, `Makefile`, `Cargo.toml`, `docker-compose.yml`, or `pyproject.toml`. If you type `test`, `dev`, `build`, `lint`, or `run`, your repository scripts appear directly in your suggestions without having to open the config file.
-- **Destructive Command Blast-Radius Guard (`[DANGER]`)**: High-risk operations (such as `rm -rf`, `git reset --hard`, `git push --force`, `git clean -fd`, `kubectl delete`) receive a prominent `[DANGER]` badge. Pressing Enter on a dangerous suggestion never executes it directly; instead, it safely loads the command onto your prompt line with a review prompt so you can inspect the blast radius before running.
-- **Screen-Share Privacy & Secret Sanitization (`[SECRET]`)**: When sharing your screen, pairing, or recording, typing keywords will not leak sensitive credentials. API keys (OpenAI, Anthropic, GitHub, AWS, Stripe), Bearer tokens, and passwords found in history are automatically masked in the display list (`sk-...****[REDACTED]`).
-- **Directory-scoped ranking**: Commands previously executed inside the current folder or git repository root get a score boost, floating project-specific commands to the top.
-- **Frecency weighting**: Blends frequency and recency scoring so commands you run often stay near the top without burying your newest runs.
-- **Exit-code filtering**: Ignores commands that failed with non-zero exit codes by default, keeping mistyped syntax and typos out of your suggestions.
-- **Recipe cheatsheets (`[recipe]`)**: When your history has fewer matches than your display limit, common syntax templates (like `tar`, `rsync`, `ffmpeg`, `docker`, `find`, `curl`, `chmod`, `lsof`) fill the remaining slots.
-- **Clean, distraction-free UI**: Compact layout with dim index numbers, colored badges (`[project]`, `[DANGER]`, `[SECRET]`, `[recipe]`), and an active selection pointer. No noisy hint blocks cluttering your terminal.
-- **Inline autosuggestion friendly**: Coexists cleanly with `zsh-autosuggestions`. Right Arrow accepts inline ghost text by default; Tab triggers standard tab completion. Termpeek only fills the command line when you deliberately press Down Arrow to select an item.
-- **Non-destructive browsing**: Moving through suggestions with Down and Up arrow keys never replaces what you typed until you explicitly select or confirm. Your prompt and undo history stay intact.
-- **Enter to run**: Pressing Enter on a highlighted safe suggestion runs it immediately. If nothing is highlighted, it runs what you typed.
-- **Escape to dismiss**: Pressing Escape hides suggestions so you can keep typing without distraction.
-- **Normal history untouched**: When your prompt is empty or no suggestions are highlighted, Up and Down arrows work as standard shell history navigation.
+## Developer Features
+
+`termpeek 2.0` introduces features built specifically for daily engineering workflows:
+
+- **Live Port Collision Pre-Flight (`Alt+K` Instant Kill)**:
+   - When typing dev server commands (`xlan`, `npm run dev`, `vite`, `expo start`, `artisan serve`, or commands with `:PORT`), Termpeek probes `127.0.0.1:<port>` and `[::1]:<port>` in under 0.08ms via non-blocking TCP socket connect.
+   - If a port is occupied by an orphaned background process, the HUD displays `⚠️ [Port <port> LOCKED by <process> (PID <pid>) - Press Alt+K to kill process]`.
+   - Pressing `Alt+K` sends `SIGTERM` to the conflicting process immediately, freeing the port without leaving your shell.
+
+- **Destructive Command Blast-Radius Audit (`[DANGER]`)**:
+   - High-risk operations (such as `rm -rf`, `git reset --hard`, `git clean -fd`, `docker system prune`) are audited in real time.
+   - Termpeek evaluates target path scope and calculates affected file counts and byte size (`⚠️ [BLAST RADIUS: 142+ files (12.4 MB) in 'build' will be deleted]`).
+   - Destructive suggestions are safely loaded to your prompt line with a review notice before execution.
+
+- **Zero-Fork Git Worktree Inspection**:
+   - Direct file inspection of `.git/HEAD`, loose refs, `.git/packed-refs`, and worktree pointer files checks whether your local branch has diverged from origin without spawning slow `git` subprocesses.
+
+- **Screen-Share Privacy & Secret Sanitization (`[SECRET]`)**:
+   - When sharing your screen, pairing, or recording, typing keywords will never leak sensitive credentials. API keys (OpenAI, Anthropic, GitHub, AWS, Stripe), Bearer tokens, and passwords found in history are automatically masked in the preview (`sk-...****[REDACTED]`).
+
+- **Project Task Discovery (`[project]`)**:
+   - In any project directory, Termpeek reads `package.json`, `Makefile`, `Cargo.toml`, `docker-compose.yml`, or `pyproject.toml`. Typing `test`, `dev`, `build`, or `run` surfaces repository scripts directly.
+
+- **Token-Aware Markov-Frecency Ranking**:
+   - First-order Markov chain transitions predict sequential workflows (e.g. `npm test` after `git commit`) blended with exponential time decay and directory affinity.
 
 ## Controls
 
 | Key | State | Action |
 | :--- | :--- | :--- |
-| **Type (2+ chars)** | Any | Searches history asynchronously and displays matches below the prompt |
-| **Right Arrow (`→`)** | Unselected (`idx = 0`) | Accepts inline autosuggestion (`zsh-autosuggestions`) or moves cursor forward |
-| **Tab** | Unselected (`idx = 0`) | Standard Zsh tab completion (`expand-or-complete`) |
-| **Down Arrow (`↓`)** | Suggestions open | Enters selection mode and moves pointer down |
-| **Up Arrow (`↑`)** | In selection (`idx > 0`) | Moves pointer up (returns to prompt when at top) |
-| **Tab / Right Arrow** | Selected (`idx > 0`) | Fills prompt with highlighted command |
-| **Enter** | Selected (`idx > 0`) | Runs highlighted safe command (loads dangerous command for review) |
-| **Enter** | Unselected (`idx = 0`) | Runs what you typed on the prompt line |
-| **Escape** | Any | Closes suggestions immediately |
-| **Up Arrow** | Empty prompt | Standard shell history |
+| **Type (2+ chars)** | Any | Shows instant inline ghost completion (`POSTDISPLAY`) |
+| **Right Arrow (`→`) / Ctrl+F** | Ghost text visible | Accepts inline ghost completion into prompt |
+| **Tab** | Ghost text visible | Accepts inline ghost completion (or standard completion) |
+| **Ctrl+Space / Alt+P** | Any | Opens Layer 2 Pre-Flight Inspector HUD |
+| **Down Arrow (`↓`)** | At prompt with matches | Opens Layer 2 Pre-Flight Inspector HUD |
+| **Up / Down (`↑`/`↓`)** | Inside HUD | Navigates candidate completions |
+| **Alt+K** | Inside HUD (Port collision) | Sends `SIGTERM` to locking PID and frees port |
+| **Enter / Tab / Right Arrow** | Inside HUD | Fills prompt with highlighted command and exits HUD |
+| **Escape / Ctrl+C / q** | Inside HUD | Exits HUD and returns to prompt cleanly |
+| **Enter** | Prompt line | Executes prompt command (prompts review if dangerous) |
+| **Ctrl+C (`^C`)** | Prompt line | Native shell `SIGINT` aborts command line cleanly |
 
 ## Configuration
 

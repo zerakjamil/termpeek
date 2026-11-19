@@ -12,6 +12,8 @@ import signal
 import sqlite3
 import re
 import json
+import socket
+import subprocess
 
 CURATED_RECIPES = [
     "tar -czvf archive.tar.gz <folder>",
@@ -78,6 +80,272 @@ DANGEROUS_COMBINED = re.compile(
 )
 
 
+class PreflightInspector:
+    """Live execution safety, port collision, and blast-radius evaluator."""
+
+    def __init__(self):
+        self.port_patterns = [
+            re.compile(r"(?:--port[= ]|-p\s*)([0-9]{2,5})"),
+            re.compile(r":([0-9]{2,5})(?:\s|/|$)"),
+        ]
+        self.cmd_port_map = {
+            "xlan": 8081,
+            "start-lan": 8081,
+            "expo": 8081,
+            "vite": 5173,
+            "artisan": 8000,
+            "next": 3000,
+            "uvicorn": 8000,
+            "flask": 5000,
+            "webpack": 8080,
+            "http.server": 8000,
+        }
+        self.port_cache = {}
+
+    def extract_port(self, cmd):
+        for pat in self.port_patterns:
+            m = pat.search(cmd)
+            if m:
+                try:
+                    p = int(m.group(1))
+                    if 1024 <= p <= 65535:
+                        return p
+                except ValueError:
+                    pass
+        cmd_lower = cmd.lower()
+        for key, port in self.cmd_port_map.items():
+            if key in cmd_lower:
+                return port
+        return None
+
+    def probe_port(self, port):
+        now = time.time()
+        if port in self.port_cache:
+            ts, res, pid, pname = self.port_cache[port]
+            if now - ts < 0.1:
+                return res, pid, pname
+
+        is_locked = False
+        # Dual-stack probe: IPv4 (127.0.0.1) and IPv6 (::1)
+        for host, family in [("127.0.0.1", socket.AF_INET), ("::1", socket.AF_INET6)]:
+            try:
+                s = socket.socket(family, socket.SOCK_STREAM)
+                s.settimeout(0.02)
+                err = s.connect_ex((host, port))
+                s.close()
+                if err == 0:
+                    is_locked = True
+                    break
+            except Exception:
+                pass
+
+        pid, pname = None, None
+        if is_locked:
+            pid, pname = self._get_port_owner(port)
+
+        self.port_cache[port] = (now, is_locked, pid, pname)
+        return is_locked, pid, pname
+
+    def _get_port_owner(self, port):
+        # Strategy 1: Targeted lsof
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-n", "-P", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                stderr=subprocess.DEVNULL,
+                timeout=0.08,
+                text=True
+            ).strip()
+            pids = out.split()
+            if pids:
+                pid = int(pids[0])
+                try:
+                    pname = subprocess.check_output(
+                        ["ps", "-p", str(pid), "-o", "comm="],
+                        stderr=subprocess.DEVNULL,
+                        timeout=0.05,
+                        text=True
+                    ).strip()
+                    pname = os.path.basename(pname)
+                except Exception:
+                    pname = "process"
+                return pid, pname
+        except Exception:
+            pass
+
+        # Strategy 2: Linux / Termux /proc filesystem fallback
+        try:
+            hex_port = f"{port:04X}"
+            target_inodes = set()
+            for net_path in ("/proc/net/tcp", "/proc/net/tcp6"):
+                if os.path.isfile(net_path):
+                    with open(net_path, "r") as f:
+                        for line in f:
+                            parts = line.strip().split()
+                            if len(parts) >= 10 and parts[3] == "0A":
+                                if parts[1].endswith(f":{hex_port}"):
+                                    target_inodes.add(parts[9])
+            if target_inodes:
+                for entry in os.listdir("/proc"):
+                    if entry.isdigit():
+                        pid = int(entry)
+                        fd_dir = f"/proc/{entry}/fd"
+                        if os.path.isdir(fd_dir):
+                            try:
+                                for fd in os.listdir(fd_dir):
+                                    link = os.readlink(f"{fd_dir}/{fd}")
+                                    for inode in target_inodes:
+                                        if f"socket:[{inode}]" in link:
+                                            comm_path = f"/proc/{entry}/comm"
+                                            pname = "process"
+                                            if os.path.isfile(comm_path):
+                                                with open(comm_path, "r") as cf:
+                                                    pname = cf.read().strip()
+                                            return pid, pname
+                            except Exception:
+                                continue
+        except Exception:
+            pass
+
+        return None, None
+
+    def probe_blast_radius(self, cwd, cmd):
+        if not (cmd.startswith("rm ") or cmd.startswith("git ") or cmd.startswith("docker ")):
+            return 0, "", 0
+
+        if re.search(r"^rm\s+.*-[a-zA-Z0-9]*[rf]|^rm\s+.*--recursive", cmd):
+            tokens = cmd.split()
+            for tok in tokens[1:]:
+                if not tok.startswith("-"):
+                    target = os.path.normpath(os.path.join(cwd, tok))
+                    if os.path.isdir(target):
+                        file_count = 0
+                        total_bytes = 0
+                        t0 = time.time()
+                        for root, _, files in os.walk(target):
+                            file_count += len(files)
+                            for f in files:
+                                try:
+                                    total_bytes += os.path.getsize(os.path.join(root, f))
+                                except OSError:
+                                    pass
+                            if file_count > 1000 or (time.time() - t0) > 0.04:
+                                break
+                        mb = total_bytes / (1024 * 1024)
+                        return 3, f"BLAST RADIUS: {file_count}+ files ({mb:.1f} MB) in '{tok}' will be deleted", 0
+                    elif os.path.isfile(target):
+                        return 3, f"BLAST RADIUS: File '{tok}' will be permanently deleted", 0
+            return 3, "BLAST RADIUS: Files will be deleted recursively", 0
+
+        if re.search(r"^git\s+reset\s+--hard", cmd):
+            return 3, "BLAST RADIUS: Working tree changes will be discarded permanently", 0
+
+        if re.search(r"^git\s+clean\s+.*-[a-zA-Z0-9]*f", cmd):
+            return 3, "BLAST RADIUS: Untracked files and directories will be removed permanently", 0
+
+        if re.search(r"^git\s+branch\s+-D", cmd):
+            return 3, "BLAST RADIUS: Unmerged branch will be deleted permanently", 0
+
+        if re.search(r"^docker\s+system\s+prune", cmd):
+            return 3, "BLAST RADIUS: Stopped containers and unused networks/images will be purged", 0
+
+        return 0, "", 0
+
+    def probe_git(self, cwd, cmd, git_root=""):
+        if not cmd.startswith("git push"):
+            return 0, "", 0
+
+        git_dir = None
+        cand_root = git_root or cwd
+        curr = cand_root
+        while curr and curr != "/":
+            cand = os.path.join(curr, ".git")
+            if os.path.isdir(cand):
+                git_dir = cand
+                break
+            elif os.path.isfile(cand):
+                try:
+                    with open(cand, "r") as f:
+                        line = f.read().strip()
+                    if line.startswith("gitdir:"):
+                        ref_dir = line.split(":", 1)[1].strip()
+                        if not os.path.isabs(ref_dir):
+                            ref_dir = os.path.normpath(os.path.join(curr, ref_dir))
+                        if os.path.isdir(ref_dir):
+                            git_dir = ref_dir
+                            break
+                except Exception:
+                    pass
+            parent = os.path.dirname(curr)
+            if parent == curr:
+                break
+            curr = parent
+
+        if not git_dir:
+            return 0, "", 0
+
+        try:
+            head_path = os.path.join(git_dir, "HEAD")
+            if not os.path.isfile(head_path):
+                return 0, "", 0
+            with open(head_path, "r", encoding="utf-8", errors="ignore") as f:
+                head_content = f.read().strip()
+            if head_content.startswith("ref: refs/heads/"):
+                branch = head_content[16:]
+                local_ref_path = os.path.join(git_dir, "refs", "heads", branch)
+                remote_ref_path = os.path.join(git_dir, "refs", "remotes", "origin", branch)
+                l_hash, r_hash = "", ""
+                if os.path.isfile(local_ref_path):
+                    with open(local_ref_path, "r") as f:
+                        l_hash = f.read().strip()
+                if os.path.isfile(remote_ref_path):
+                    with open(remote_ref_path, "r") as f:
+                        r_hash = f.read().strip()
+
+                # Packed refs fallback
+                packed_path = os.path.join(git_dir, "packed-refs")
+                if (not l_hash or not r_hash) and os.path.isfile(packed_path):
+                    try:
+                        with open(packed_path, "r", encoding="utf-8", errors="ignore") as f:
+                            for p_line in f:
+                                p_line = p_line.strip()
+                                if not p_line or p_line.startswith("#") or p_line.startswith("^"):
+                                    continue
+                                p_parts = p_line.split()
+                                if len(p_parts) == 2:
+                                    h, ref_name = p_parts[0], p_parts[1]
+                                    if ref_name == f"refs/heads/{branch}" and not l_hash:
+                                        l_hash = h
+                                    elif ref_name == f"refs/remotes/origin/{branch}" and not r_hash:
+                                        r_hash = h
+                    except Exception:
+                        pass
+
+                if l_hash and r_hash and l_hash != r_hash and "push" in cmd:
+                    return 1, f"Git branch '{branch}' is not in sync with origin/{branch}", 0
+        except Exception:
+            pass
+        return 0, "", 0
+
+    def evaluate(self, cwd, cmd, git_root=""):
+        port = self.extract_port(cmd)
+        if port:
+            is_locked, pid, pname = self.probe_port(port)
+            if is_locked:
+                if pid:
+                    return 2, f"Port {port} LOCKED by {pname} (PID {pid}) - Press Alt+K to kill process", pid
+                return 2, f"Port {port} LOCKED (in use) - Connection will collide", 0
+
+        code, msg, pid = self.probe_blast_radius(cwd, cmd)
+        if code > 0:
+            return code, msg, pid
+
+        code, msg, pid = self.probe_git(cwd, cmd, git_root)
+        if code > 0:
+            return code, msg, pid
+
+        return 0, "", 0
+
+
 class QueryWorker:
     def __init__(self):
         self.db_path = os.path.expanduser("~/.local/share/atuin/history.db")
@@ -104,6 +372,7 @@ class QueryWorker:
         self.project_tasks_enabled = int(os.environ.get("TERMPEEK_PROJECT_TASKS", "1"))
         self.safety_guard_enabled = int(os.environ.get("TERMPEEK_SAFETY_GUARD", "1"))
         self.mask_secrets_enabled = int(os.environ.get("TERMPEEK_MASK_SECRETS", "1"))
+        self.preflight = PreflightInspector()
 
         self._refresh_history_cache()
 
@@ -504,121 +773,125 @@ class QueryWorker:
     def query(self, query_id, cwd, buffer_text, prev_cmd=""):
         trimmed = buffer_text.strip()
         if len(trimmed) < 2:
-            return f"{query_id}\t0"
+            return f"{query_id}\t0\t0\t\t0"
 
         prev_clean = prev_cmd.strip() if prev_cmd else ""
         cache_key = (cwd, trimmed, prev_clean)
+
         if cache_key in self.query_cache:
-            return f"{query_id}\t{self.query_cache[cache_key]}"
+            serialized_candidates = self.query_cache[cache_key]
+        else:
+            self.load_project_tasks(cwd)
+            git_root = self.get_git_root(cwd)
 
-        self.load_project_tasks(cwd)
-        git_root = self.get_git_root(cwd)
+            matches = []
+            seen = set()
 
-        matches = []
-        seen = set()
+            def add_candidate(raw_cmd, tag=""):
+                clean = raw_cmd.replace("\r", "").replace("\n", " && ").strip()
+                if not clean or clean == trimmed or clean in seen:
+                    return False
+                seen.add(clean)
 
-        def add_candidate(raw_cmd, tag=""):
-            clean = raw_cmd.replace("\r", "").replace("\n", " && ").strip()
-            if not clean or clean == trimmed or clean in seen:
-                return False
-            seen.add(clean)
+                if clean in self.meta_cache:
+                    is_danger, display_str = self.meta_cache[clean]
+                else:
+                    is_danger = 1 if self.is_dangerous(clean) else 0
+                    _, display_str = self.check_and_mask_secret(clean)
+                    if len(self.meta_cache) < 2048:
+                        self.meta_cache[clean] = (is_danger, display_str)
 
-            if clean in self.meta_cache:
-                is_danger, display_str = self.meta_cache[clean]
-            else:
-                is_danger = 1 if self.is_dangerous(clean) else 0
-                _, display_str = self.check_and_mask_secret(clean)
-                if len(self.meta_cache) < 2048:
-                    self.meta_cache[clean] = (is_danger, display_str)
+                tags = []
+                if tag:
+                    tags.append(tag)
+                if is_danger:
+                    tags.append("[DANGER]")
+                if display_str != clean:
+                    tags.append("[SECRET]")
+                tag_str = " ".join(tags)
+                matches.append((clean, tag_str, is_danger, display_str))
+                return True
 
-            tags = []
-            if tag:
-                tags.append(tag)
-            if is_danger:
-                tags.append("[DANGER]")
-            if display_str != clean:
-                tags.append("[SECRET]")
-            tag_str = " ".join(tags)
-            matches.append((clean, tag_str, is_danger, display_str))
-            return True
+            lower_trim = trimmed.lower()
+            query_tokens = lower_trim.replace("/", " ").split()
+            if not query_tokens:
+                query_tokens = [lower_trim]
 
-        lower_trim = trimmed.lower()
-        query_tokens = lower_trim.replace("/", " ").split()
-        if not query_tokens:
-            query_tokens = [lower_trim]
-
-        # Step 1: Project tasks
-        for task in self.project_tasks:
-            if self._match_quality(lower_trim, query_tokens, task.lower()) > 0.0:
-                add_candidate(task, "[project]")
-                if len(matches) >= self.max_results:
-                    break
-
-        # Step 2: History (Token-Aware + Exponential Frecency + CWD + Markov Transitions)
-        self._refresh_history_cache()
-        if len(matches) < self.max_results and self.indexed_stats:
-            trans_map = self.transitions.get(prev_clean) if prev_clean else None
-            trans_total = self.transition_totals.get(prev_clean, 0) if prev_clean else 0
-            first_tok = query_tokens[0]
-
-            scored_rows = []
-            for stat in self.indexed_stats:
-                cmd_lower = stat["lower"]
-                if first_tok not in cmd_lower:
-                    continue
-                m_score = self._match_quality(lower_trim, query_tokens, cmd_lower)
-                if m_score <= 0.0:
-                    continue
-
-                # Directory specificity boost
-                cwd_score = 0.0
-                cwd_map = stat["cwd_counts"]
-                if cwd and cwd in cwd_map:
-                    cwd_score = 65.0 + 12.0 * math.log2(1.0 + cwd_map[cwd])
-                elif git_root and cwd_map:
-                    for c_dir in cwd_map:
-                        if c_dir.startswith(git_root):
-                            cwd_score = 32.0
-                            break
-
-                # First-order Markov transition boost P(cmd_t | cmd_{t-1})
-                markov_score = 0.0
-                if trans_map and trans_total > 0:
-                    t_cnt = trans_map.get(stat["cmd"], 0)
-                    if t_cnt > 0:
-                        markov_score = (
-                            90.0 * (t_cnt / trans_total)
-                            + 18.0 * math.log2(1.0 + t_cnt)
-                        )
-
-                total_score = m_score + cwd_score + stat["base_score"] + markov_score
-                scored_rows.append((total_score, stat["cmd"]))
-
-            scored_rows.sort(key=lambda x: x[0], reverse=True)
-            for _, row_cmd in scored_rows:
-                add_candidate(row_cmd)
-                if len(matches) >= self.max_results:
-                    break
-
-        # Step 3: Recipes fallback
-        if self.recipes_enabled and len(matches) < self.max_results:
-            for recipe in CURATED_RECIPES:
-                if self._match_quality(lower_trim, query_tokens, recipe.lower()) > 0.0:
-                    add_candidate(recipe, "[recipe]")
+            # Step 1: Project tasks
+            for task in self.project_tasks:
+                if self._match_quality(lower_trim, query_tokens, task.lower()) > 0.0:
+                    add_candidate(task, "[project]")
                     if len(matches) >= self.max_results:
                         break
 
-        # Build serialized response payload
-        parts = [str(len(matches))]
-        for clean, tag_str, is_danger, display_str in matches:
-            parts.extend([clean, tag_str, str(is_danger), display_str])
-        serialized_payload = "\t".join(parts)
+            # Step 2: History (Token-Aware + Exponential Frecency + CWD + Markov Transitions)
+            self._refresh_history_cache()
+            if len(matches) < self.max_results and self.indexed_stats:
+                trans_map = self.transitions.get(prev_clean) if prev_clean else None
+                trans_total = self.transition_totals.get(prev_clean, 0) if prev_clean else 0
+                first_tok = query_tokens[0]
 
-        if len(self.query_cache) > 512:
-            self.query_cache.clear()
-        self.query_cache[cache_key] = serialized_payload
+                scored_rows = []
+                for stat in self.indexed_stats:
+                    cmd_lower = stat["lower"]
+                    if first_tok not in cmd_lower:
+                        continue
+                    m_score = self._match_quality(lower_trim, query_tokens, cmd_lower)
+                    if m_score <= 0.0:
+                        continue
 
-        return f"{query_id}\t{serialized_payload}"
+                    # Directory specificity boost
+                    cwd_score = 0.0
+                    cwd_map = stat["cwd_counts"]
+                    if cwd and cwd in cwd_map:
+                        cwd_score = 65.0 + 12.0 * math.log2(1.0 + cwd_map[cwd])
+                    elif git_root and cwd_map:
+                        for c_dir in cwd_map:
+                            if c_dir.startswith(git_root):
+                                cwd_score = 32.0
+                                break
+
+                    # First-order Markov transition boost P(cmd_t | cmd_{t-1})
+                    markov_score = 0.0
+                    if trans_map and trans_total > 0:
+                        t_cnt = trans_map.get(stat["cmd"], 0)
+                        if t_cnt > 0:
+                            markov_score = (
+                                90.0 * (t_cnt / trans_total)
+                                + 18.0 * math.log2(1.0 + t_cnt)
+                            )
+
+                    total_score = m_score + cwd_score + stat["base_score"] + markov_score
+                    scored_rows.append((total_score, stat["cmd"]))
+
+                scored_rows.sort(key=lambda x: x[0], reverse=True)
+                for _, row_cmd in scored_rows:
+                    add_candidate(row_cmd)
+                    if len(matches) >= self.max_results:
+                        break
+
+            # Step 3: Recipes fallback
+            if self.recipes_enabled and len(matches) < self.max_results:
+                for recipe in CURATED_RECIPES:
+                    if self._match_quality(lower_trim, query_tokens, recipe.lower()) > 0.0:
+                        add_candidate(recipe, "[recipe]")
+                        if len(matches) >= self.max_results:
+                            break
+
+            parts = [str(len(matches))]
+            for clean, tag_str, is_danger, display_str in matches:
+                parts.extend([clean, tag_str, str(is_danger), display_str])
+            serialized_candidates = "\t".join(parts)
+
+            if len(self.query_cache) > 512:
+                self.query_cache.clear()
+            self.query_cache[cache_key] = serialized_candidates
+
+        # Step 4: Live Pre-Flight Inspection (ports, git divergence, blast radius)
+        git_root = self.get_git_root(cwd)
+        pf_code, pf_msg, pf_pid = self.preflight.evaluate(cwd, trimmed, git_root)
+
+        return f"{query_id}\t{serialized_candidates}\t{pf_code}\t{pf_msg}\t{pf_pid}"
 
 
 def main():

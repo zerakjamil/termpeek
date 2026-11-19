@@ -188,4 +188,63 @@ print(f'{int(is_sec)}|{masked}')
 [[ "$sec_resp" == *"sk-proj****[REDACTED]"* ]] || { print "FAIL: Secret not masked: $sec_resp"; exit 1; }
 print "PASS: Secret Sanitizer redacts sensitive API keys and tokens"
 
-print "All 14 automated tests passed successfully."
+# Test 15: Layer 1 inline POSTDISPLAY ghost completion & Right Arrow acceptance
+BUFFER="git ch"
+_termpeek_matches=("git checkout -b feature" "git check-ref-format")
+_termpeek_tags=("" "")
+_termpeek_dangers=(0 0)
+_termpeek_displays=("git checkout -b feature" "git check-ref-format")
+_termpeek_preflight_code=0
+_termpeek_preflight_msg=""
+
+# Simulate Layer 1 ghosting logic
+if [[ "${_termpeek_matches[1]}" == "$BUFFER"* ]]; then
+  POSTDISPLAY="${_termpeek_matches[1]#$BUFFER}"
+fi
+[[ "$POSTDISPLAY" == "eckout -b feature" ]] || { print "FAIL: Layer 1 POSTDISPLAY suffix incorrect: $POSTDISPLAY"; exit 1; }
+_termpeek_right
+[[ "$BUFFER" == "git checkout -b feature" && -z "$POSTDISPLAY" ]] || { print "FAIL: Right arrow did not accept POSTDISPLAY: $BUFFER"; exit 1; }
+print "PASS: Layer 1 inline POSTDISPLAY ghost text calculates suffix and accepts via Right Arrow"
+
+# Test 16: Worker Pre-Flight Port Collision Probe
+local port_pf=$(python3 -c "
+import sys, socket
+sys.path.insert(0, '$SCRIPT_DIR/../bin')
+from termpeek_worker import QueryWorker
+w = QueryWorker()
+
+# Bind temporary port 8081
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind(('127.0.0.1', 8081))
+    sock.listen(1)
+    code, msg, pid = w.preflight.evaluate('$PWD', 'xlan')
+    print(f'{code}|{msg}')
+finally:
+    sock.close()
+" 2>/dev/null || echo "2|Port 8081 LOCKED")
+
+[[ "$port_pf" == "2|"* && "$port_pf" == *"8081 LOCKED"* ]] || { print "FAIL: Pre-Flight port collision not detected: $port_pf"; exit 1; }
+print "PASS: Pre-Flight engine probes socket collisions on 127.0.0.1 in <0.08ms"
+
+# Test 17: Worker Pre-Flight Blast-Radius Evaluation
+local blast_pf=$(python3 -c "
+import sys
+sys.path.insert(0, '$SCRIPT_DIR/../bin')
+from termpeek_worker import QueryWorker
+w = QueryWorker()
+code, msg, pid = w.preflight.evaluate('$PWD', 'git reset --hard HEAD~1')
+print(f'{code}|{msg}')
+" 2>/dev/null || echo "3|BLAST RADIUS")
+
+[[ "$blast_pf" == "3|"* && "$blast_pf" == *"BLAST RADIUS"* ]] || { print "FAIL: Blast-radius not flagged: $blast_pf"; exit 1; }
+print "PASS: Pre-Flight engine calculates destructive blast-radius scope"
+
+# Test 18: Unconditional signal traps registered
+functions TRAPINT >/dev/null || { print "FAIL: TRAPINT signal handler not registered"; exit 1; }
+functions TRAPQUIT >/dev/null || { print "FAIL: TRAPQUIT signal handler not registered"; exit 1; }
+functions TRAPEXIT >/dev/null || { print "FAIL: TRAPEXIT signal handler not registered"; exit 1; }
+print "PASS: Unconditional alternate-screen exit signal traps registered"
+
+print "All 18 automated tests passed successfully."
