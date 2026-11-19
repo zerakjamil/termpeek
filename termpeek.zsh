@@ -94,6 +94,8 @@ _termpeek_clear_display() {
 
 # Asynchronous worker response handler (triggered by zle -F)
 _termpeek_async_callback() {
+  emulate -L zsh
+  setopt localoptions extendedglob
   local fd=$1
   local err=$2
 
@@ -116,11 +118,12 @@ _termpeek_async_callback() {
     fi
     [[ -z "$line" ]] && return 0
 
-    local -a parts=("${(@ps:\t:)line}")
-    local resp_qid="${parts[1]}"
+    local resp_qid="${line%%$'\t'*}"
+    [[ "$resp_qid" == <-> ]] || break
 
     # If this response matches our current active query, process it
     if (( resp_qid == _termpeek_qid )); then
+      local -a parts=("${(@ps:\t:)line}")
       local buf="${BUFFER:-$_termpeek_last_buf}"
       local trimmed="${buf## #}"
       trimmed="${trimmed%% #}"
@@ -130,6 +133,7 @@ _termpeek_async_callback() {
       fi
 
       local count="${parts[2]}"
+      [[ "$count" == <-> ]] || count=0
       _termpeek_matches=()
       _termpeek_tags=()
       _termpeek_dangers=()
